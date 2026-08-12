@@ -672,15 +672,39 @@ pub fn run() {
     if !config::is_home() {
         // Check if already installed elsewhere
         if health::task_exists() || config::canonical_home().is_some() {
-            let existing = config::canonical_home()
-                .map(|h| h.to_string_lossy().to_string())
-                .unwrap_or_else(|| "an unknown location".to_string());
-            rfd::MessageDialog::new()
-                .set_title("Already Installed")
-                .set_description(&format!("LRGEX Restore is already installed at:\n{}\n\nOpen it from there.\n\nTo move: Tools -> Unlink from Windows first, then run this exe again.", existing))
-                .set_buttons(rfd::MessageButtons::Ok)
-                .show();
-            return;
+            let existing = config::canonical_home();
+            // If the old home's exe still exists → legit other install, refuse.
+            // If it's GONE (folder moved/deleted) → auto re-home here (no trap).
+            let old_exe = existing.as_ref().map(|h| h.join("LRGEXRestore.exe"));
+            let old_still_there = old_exe.as_ref().map(|e| e.exists()).unwrap_or(false);
+            if old_still_there {
+                let existing_str = existing
+                    .map(|h| h.to_string_lossy().to_string())
+                    .unwrap_or_else(|| "an unknown location".to_string());
+                rfd::MessageDialog::new()
+                    .set_title("Already Installed")
+                    .set_description(&format!("LRGEX Restore is already installed at:\n{}\n\nOpen it from there.\n\nTo move: Tools -> Unlink from Windows first, then run this exe again.", existing_str))
+                    .set_buttons(rfd::MessageButtons::Ok)
+                    .show();
+                return;
+            } else {
+                // Old home is gone — clean up ALL stale references (full cascade):
+                use std::os::windows::process::CommandExt;
+                // 1. Registry canonical home
+                config::clear_canonical_home();
+                // 2. Scheduled task (points to dead exe path)
+                let _ = std::process::Command::new("schtasks.exe")
+                    .args(["/Delete", "/TN", "LRGEX-Restore-Rust", "/F"])
+                    .creation_flags(0x08000000u32)
+                    .output();
+                // 3. Right-click context menu (points to dead exe path)
+                let _ = std::process::Command::new("reg.exe")
+                    .args(["delete", r"HKCU\Software\Classes\Directory\shell\LRGEXRestore", "/f"])
+                    .creation_flags(0x08000000u32)
+                    .output();
+                // Fall through to setup_home() → re-homes here.
+                // New exe on next launch registers fresh task (register_sync_task at line ~708).
+            }
         }
         setup_home();
         return;
@@ -694,12 +718,28 @@ pub fn run() {
     // Verify: this exe IS the canonical home exe
     if let Some(canonical) = config::canonical_home() {
         if config::script_dir() != canonical {
+            // Self-heal: if the old canonical home is GONE (folder moved),
+            // re-register here instead of trapping the user.
+            let old_exe = canonical.join("LRGEXRestore.exe");
+            if !old_exe.exists() {
+                config::set_canonical_home(&config::script_dir());
+                use std::os::windows::process::CommandExt;
+                let _ = std::process::Command::new("schtasks.exe")
+                    .args(["/Delete", "/TN", "LRGEX-Restore-Rust", "/F"])
+                    .creation_flags(0x08000000u32)
+                    .output();
+                let _ = std::process::Command::new("reg.exe")
+                    .args(["delete", r"HKCU\Software\Classes\Directory\shell\LRGEXRestore", "/f"])
+                    .creation_flags(0x08000000u32)
+                    .output();
+            } else {
             rfd::MessageDialog::new()
                 .set_title("Wrong Copy")
                 .set_description(&format!("This is not the installed copy.\n\nThe real installation is at:\n{}", canonical.display()))
                 .set_buttons(rfd::MessageButtons::Ok)
                 .show();
             return;
+            }
         }
     }
 
@@ -1090,6 +1130,17 @@ Failed: {}", failures.join(", ")));
         }
         let mut details = String::new();
         let mut ok_count = 0;
+        // STALE check: based on when the SYNC LAST RAN (sync-status.json mtime),
+        // not individual backup file age. If the sync ran within the interval,
+        // all folders were checked — unchanged folders are NOT stale just because
+        // their backup file is old (change detection correctly skipped them).
+        let sync_age_hours: i32 = std::fs::metadata(health::status_path())
+            .ok()
+            .and_then(|m| m.modified().ok())
+            .and_then(|t| t.elapsed().ok())
+            .map(|e| (e.as_secs() / 3600) as i32)
+            .unwrap_or(999);
+        let sync_stale = sync_age_hours > cfg.sync_interval_minutes / 60;
         for j in &cfg.junctions {
             let leaf = std::path::Path::new(&j.source_path)
                 .file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
@@ -1109,7 +1160,7 @@ Failed: {}", failures.join(", ")));
                     format!("{}d ago", age_hours / 24)
                 };
                 let src_status = if source_exists { "source OK" } else { "source MISSING" };
-                let stale = if (age_hours as i32) > cfg.sync_interval_minutes / 60 { " \u{26a0} STALE" } else { "" };
+                let stale = if sync_stale { " \u{26a0} STALE" } else { "" };
                 details.push_str(&format!("\n  {} \u{2014} {:.1} MB, {}, {}{}", leaf, size_mb, age_str, src_status, stale));
             } else {
                 details.push_str(&format!("\n  {} \u{2014} NO BACKUP", leaf));

@@ -1,5 +1,34 @@
 # Patch Notes — LRGEX Restore
 
+## v1.3.0 — Progress system + compression engine + stability
+
+### Compression
+- Parallel reads (rayon, 24 threads): 139k files 22min → ~5s warm, ~143s cold
+- Single-walk design (one pass replaces three)
+- Manual tar headers (avoids redundant stat per file)
+- ByteReader for large files (>8MB streams, doesn't preload)
+- Verified: bsdtar decoded all 139,083 files, zero errors
+
+### Progress bar
+- Byte-based: % = bytes done / bytes total (works for any folder)
+- Heartbeat: 500ms JSON writer with animated spinner (⠋⠙⠹⠸⠼⠴⠦⠧)
+- Live display: spinner + % + MB/s + ETA (never freezes)
+- Liveness check: detects dead sync processes (stale heartbeat + dead PID)
+- Graceful shutdown: finish() writes terminal snapshot before exit
+
+### Stability
+- Fixed: progress frozen at 1% (Drop impl killed heartbeat after first file)
+- Fixed: false 'sync stopped unexpectedly' after successful backup
+- Fixed: config migrate-loop hang on un-contractable paths (E:\)
+- Fixed: folder list not refreshing after right-click add
+- Fixed: false STALE warnings on unchanged folders (now checks sync-runtime, not backup-age)
+
+### UI
+- 'Protect Folder' / 'Restore Now' buttons
+- Natural health labels (All protected, Protecting…, Needs attention)
+- Safety summary: green 'N folders protected'
+- Tagline: 'Never lose your folders after reinstalling Windows.'
+
 ## v1.2.34 — Progress fix + stability
 - Byte-based progress: % = bytes done / bytes total (works for any folder)
 - Fixed: progress frozen at 1% (Drop impl killed heartbeat after first file)

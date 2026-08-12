@@ -4,11 +4,11 @@
 
 # LRGEX Restore
 
-**Version 1.2.34**
+**Version 1.3.0**
 
 **Automatic folder backup, versioning, and restore after a Windows reinstall.**
 
-**Portable • Open Source • MIT Licensed**
+**Portable • Open Source • GPL-3.0 Licensed**
 
 
 
@@ -59,7 +59,7 @@ Hours of progress and years of customization disappear because Windows doesn't p
 - **Automatic synchronization** — changes are backed up in the background.
 - **Built-in version history** — restore previous snapshots whenever you need them.
 - **Automatic restore** — after reinstalling Windows, missing folders are restored to their original paths.
-- **Portable** — a single 14 MB executable. No installer. No dependencies.
+- **Portable** — a single 17 MB executable. No installer. No dependencies.
 
 ---
 
@@ -113,4 +113,4 @@ Every folder goes back to its exact original path.
 
 ## License
 
-MIT License. See [LICENSE](LICENSE).
+GNU General Public License v3. See [LICENSE](LICENSE) and [TRADEMARK.md](TRADEMARK.md).
