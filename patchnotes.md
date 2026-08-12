@@ -1,5 +1,21 @@
 # Patch Notes — LRGEX Restore
 
+## v1.4.0 — Self-healing + GPL + STALE fix
+
+### Self-healing (move folder anywhere)
+- Fixed: app trapped if home folder moved (couldn't open, couldn't Unlink)
+- Now self-heals: detects dead old path → re-registers here (registry + task + context menu cleanup)
+- Works for both scenarios: fresh exe (no marker) AND moved folder (marker travels)
+
+### STALE fix
+- Fixed: false STALE warnings on unchanged folders
+- Now checks when the sync LAST RAN (sync-status.json), not backup file age
+- No STALE unless the sync itself hasn't run within the interval
+
+### License
+- Changed: MIT → GPL-3.0
+- Added: TRADEMARK.md (LRGEX name/logo protection)
+
 ## v1.3.0 — Progress system + compression engine + stability
 
 ### Compression
