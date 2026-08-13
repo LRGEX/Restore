@@ -81,6 +81,269 @@ fn read_whole(path: &Path, size: u64) -> std::io::Result<Vec<u8>> {
     Ok(buf)
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    /// Helper: create a temp test folder with known files
+    fn make_test_folder() -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("lrgex_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // Create a subfolder
+        let sub = dir.join("subfolder");
+        std::fs::create_dir_all(&sub).unwrap();
+        // Create files with known content
+        std::fs::write(dir.join("file1.txt"), b"Hello World").unwrap();
+        std::fs::write(dir.join("file2.log"), b"Log data here").unwrap();
+        std::fs::write(sub.join("nested.txt"), b"Nested content").unwrap();
+        // Create a file that should be excluded
+        std::fs::write(dir.join("node_modules"), b"should be excluded").unwrap();
+        dir
+    }
+
+    #[test]
+    fn test_walk_tree_finds_all_files() {
+        let dir = make_test_folder();
+        let (files, total_bytes, count) = walk_tree(&dir, &[]);
+        println!("\n=== WALK_TREE: {} ===", dir.display());
+        println!("  files: {}, bytes: {}", count, total_bytes);
+        for f in &files {
+            println!("  {} ({} bytes)", f.rel.display(), f.size);
+        }
+        assert_eq!(count, 4, "Should find 4 files (including node_modules)");
+        assert!(total_bytes > 0, "Should have non-zero bytes");
+        // Verify each file has correct fields
+        let rels: Vec<String> = files.iter().map(|f| f.rel.to_string_lossy().to_string()).collect();
+        assert!(rels.contains(&"file1.txt".to_string()), "Missing file1.txt");
+        assert!(rels.contains(&"file2.log".to_string()), "Missing file2.log");
+        assert!(rels.contains(&"subfolder\\nested.txt".to_string()) ||
+               rels.contains(&"subfolder/nested.txt".to_string()), "Missing nested.txt");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_walk_tree_excludes_names() {
+        let dir = make_test_folder();
+        let excluded = vec!["node_modules".to_string()];
+        let (files, _, count) = walk_tree(&dir, &excluded);
+        println!("\n=== WALK_TREE EXCLUDED ===");
+        println!("  files after exclude: {}", count);
+        assert_eq!(count, 3, "Should find 3 files (node_modules excluded)");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_walk_tree_skips_symlinks() {
+        let dir = make_test_folder();
+        // Create a symlink (may fail on Windows without admin)
+        #[cfg(windows)]
+        {
+            let link = dir.join("symlink.txt");
+            let _ = std::os::windows::fs::symlink_file(dir.join("file1.txt"), &link);
+        }
+        let (files, _, count) = walk_tree(&dir, &[]);
+        println!("\n=== WALK_TREE SYMLINKS ===");
+        println!("  files: {} (symlinks should be skipped)", count);
+        assert_eq!(count, 4, "Symlink should be skipped, still 4 files");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_walk_tree_empty_folder() {
+        let dir = std::env::temp_dir().join(format!("lrgex_empty_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (files, bytes, count) = walk_tree(&dir, &[]);
+        assert_eq!(count, 0, "Empty folder should have 0 files");
+        assert_eq!(bytes, 0, "Empty folder should have 0 bytes");
+        assert!(files.is_empty(), "File list should be empty");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_walk_tree_byte_count_accurate() {
+        let dir = std::env::temp_dir().join(format!("lrgex_bytes_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.txt"), b"12345").unwrap(); // 5 bytes
+        std::fs::write(dir.join("b.txt"), b"1234567890").unwrap(); // 10 bytes
+        let (_, total, count) = walk_tree(&dir, &[]);
+        assert_eq!(count, 2);
+        assert_eq!(total, 15, "Total bytes should be 15 (5+10)");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_compress_decompress_roundtrip() {
+        let src = make_test_folder();
+        let dest = std::env::temp_dir().join(format!("lrgex_test_archive_{}.tar.zst", std::process::id()));
+
+        println!("\n=== COMPRESS + DECOMPRESS ROUND-TRIP ===");
+        println!("  Source: {}", src.display());
+        println!("  Archive: {}", dest.display());
+
+        // Compress
+        let (ok, skipped) = compress_folder(&src, &dest, &[], None);
+        assert!(ok, "Compression should succeed");
+        assert!(dest.exists(), "Archive file should exist");
+        assert!(dest.metadata().unwrap().len() > 0, "Archive should be non-empty");
+        println!("  Compressed: {} bytes, {} skipped", dest.metadata().unwrap().len(), skipped.len());
+
+        // Decompress to a temp folder
+        let extract_dir = std::env::temp_dir().join(format!("lrgex_test_extract_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&extract_dir);
+        std::fs::create_dir_all(&extract_dir).unwrap();
+        let (decompressed_ok, msg) = decompress_archive(&dest, &extract_dir);
+        assert!(decompressed_ok, "Decompression should succeed: {}", msg);
+        println!("  Decompressed to: {}", extract_dir.display());
+
+        // Verify files match
+        let original_file1 = std::fs::read(src.join("file1.txt")).unwrap();
+        let extracted_file1 = std::fs::read(extract_dir.join("file1.txt")).unwrap_or_default();
+        assert_eq!(original_file1, extracted_file1, "file1.txt content should match");
+
+        let original_nested = std::fs::read(src.join("subfolder").join("nested.txt")).unwrap();
+        let extracted_nested_path = extract_dir.join("subfolder").join("nested.txt");
+        let extracted_nested = std::fs::read(&extracted_nested_path).unwrap_or_default();
+        assert_eq!(original_nested, extracted_nested, "nested.txt content should match");
+
+        println!("  ✓ file1.txt matches");
+        println!("  ✓ subfolder/nested.txt matches");
+        println!("  ✓ Round-trip PASSED");
+
+        // Cleanup
+        let _ = std::fs::remove_dir_all(&src);
+        let _ = std::fs::remove_dir_all(&extract_dir);
+        let _ = std::fs::remove_file(&dest);
+    }
+
+    #[test]
+    fn test_compress_with_exclusions() {
+        let src = make_test_folder();
+        let dest = std::env::temp_dir().join(format!("lrgex_test_excl_{}.tar.zst", std::process::id()));
+        let excluded = vec!["node_modules".to_string()];
+
+        let (ok, _skipped) = compress_folder(&src, &dest, &excluded, None);
+        assert!(ok, "Compression with exclusions should succeed");
+
+        // Decompress + verify node_modules is NOT in the archive
+        let extract_dir = std::env::temp_dir().join(format!("lrgex_test_excl_extract_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&extract_dir);
+        std::fs::create_dir_all(&extract_dir).unwrap();
+        let (dec_ok, _) = decompress_archive(&dest, &extract_dir);
+        assert!(dec_ok, "Decompression should succeed");
+        assert!(!extract_dir.join("node_modules").exists(), "node_modules should be excluded from archive");
+        assert!(extract_dir.join("file1.txt").exists(), "file1.txt should be in archive");
+
+        println!("\n=== EXCLUSIONS TEST ===");
+        println!("  ✓ node_modules excluded");
+        println!("  ✓ file1.txt present");
+
+        let _ = std::fs::remove_dir_all(&src);
+        let _ = std::fs::remove_dir_all(&extract_dir);
+        let _ = std::fs::remove_file(&dest);
+    }
+
+    #[test]
+    fn test_compress_large_file_streaming() {
+        let dir = std::env::temp_dir().join(format!("lrgex_large_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Create a file larger than BIG_FILE (8MB)
+        let large_path = dir.join("large.bin");
+        let mut f = std::fs::File::create(&large_path).unwrap();
+        let chunk = vec![0xABu8; 1024 * 1024]; // 1MB chunks
+        for _ in 0..10 {
+            f.write_all(&chunk).unwrap();
+        } // 10MB file
+        drop(f);
+
+        let dest = std::env::temp_dir().join(format!("lrgex_large_{}.tar.zst", std::process::id()));
+        let (ok, _) = compress_folder(&dir, &dest, &[], None);
+        assert!(ok, "Large file compression should succeed");
+
+        // Decompress + verify size
+        let extract_dir = std::env::temp_dir().join(format!("lrgex_large_extract_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&extract_dir);
+        std::fs::create_dir_all(&extract_dir).unwrap();
+        let (dec_ok, _) = decompress_archive(&dest, &extract_dir);
+        assert!(dec_ok, "Large file decompression should succeed");
+
+        let orig_size = std::fs::metadata(&large_path).unwrap().len();
+        let extracted_path = extract_dir.join("large.bin");
+        assert!(extracted_path.exists(), "large.bin should exist in archive");
+        let extracted_size = std::fs::metadata(&extracted_path).unwrap().len();
+        assert_eq!(orig_size, extracted_size, "Large file size should match after round-trip: {} vs {}", orig_size, extracted_size);
+
+        println!("\n=== LARGE FILE STREAMING TEST ===");
+        println!("  Original: {} bytes", orig_size);
+        println!("  Extracted: {} bytes", extracted_size);
+        println!("  ✓ Size matches");
+
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&extract_dir);
+        let _ = std::fs::remove_file(&dest);
+    }
+
+    #[test]
+    fn test_decompress_nonexistent_archive() {
+        let result = decompress_archive(std::path::Path::new("C:\\nonexistent\\fake.tar.zst"), std::path::Path::new("C:\\tmp\\fake_extract"));
+        assert!(!result.0, "Should fail on nonexistent archive");
+        println!("\n=== NONEXISTENT ARCHIVE ===");
+        println!("  ✓ Correctly returned failure");
+    }
+
+    #[test]
+    fn test_decompress_real_hermes_archive() {
+        let archive = std::path::PathBuf::from(r"C:\Users\lrg4you\OneDrive\Documents\LRGEX-saves\backup\hermes\hermes.tar.zst");
+        if !archive.exists() {
+            println!("\n=== HERMES ARCHIVE: SKIPPED (not found) ===");
+            return;
+        }
+        println!("\n=== HERMES ARCHIVE VERIFICATION ===");
+        println!("  Archive: {} ({} MB)", archive.display(), archive.metadata().unwrap().len() / 1_048_576);
+
+        let extract_dir = std::env::temp_dir().join(format!("lrgex_hermes_verify_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&extract_dir);
+        std::fs::create_dir_all(&extract_dir).unwrap();
+
+        let (ok, msg) = decompress_archive(&archive, &extract_dir);
+        if ok {
+            // Count extracted files
+            let mut count = 0usize;
+            for entry in walk_dir_count(&extract_dir) {
+                count += 1;
+                let _ = entry;
+            }
+            println!("  Decompressed: {} files", count);
+            assert!(count > 100000, "Hermes should have 139k+ files, got {}", count);
+            println!("  ✓ Archive is valid + complete");
+        } else {
+            panic!("Hermes archive decompression failed: {}", msg);
+        }
+
+        let _ = std::fs::remove_dir_all(&extract_dir);
+    }
+
+    fn walk_dir_count(dir: &Path) -> Vec<std::path::PathBuf> {
+        let mut files = Vec::new();
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    files.extend(walk_dir_count(&path));
+                } else {
+                    files.push(path);
+                }
+            }
+        }
+        files
+    }
+}
+
 /// Compress a source directory to a .tar.zst. Files are read in parallel batches
 /// (rayon) and written to the tar stream in order. `prewalked` lets the caller
 /// share the change-detection walk (one walk total).
