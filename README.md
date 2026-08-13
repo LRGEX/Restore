@@ -111,7 +111,7 @@ Every folder goes back to its exact original path.
 
 ## Windows Defender false positive
 
-Windows Defender may flag LRGEX Restore as a false positive (`Trojan:Win32/Bearfoos.B!ml` / `Behavior:Win32/Persistence.A!ml`). **This is a confirmed false positive.** The exe is [verified clean on VirusTotal](https://www.virustotal.com/gui/file/4eaa8c8251cacd1d344682f377d77529d69ff3bb64d44dae6f9c6d3f2e9c2217) — 0 detections across 70+ engines. Defender's machine learning flags the app because it:
+Windows Defender may flag LRGEX Restore as a false positive (`Trojan:Win32/Bearfoos.B!ml` / `Behavior:Win32/Persistence.A!ml`). **This is a confirmed false positive.** The exe is [verified clean on VirusTotal](https://www.virustotal.com/gui/file/3f8a549f9532248fd928ee9f128e1ae6981d82a873bd285068aa5f6f31453576) — 0 detections across 70+ engines. Defender's machine learning flags the app because it:
 
 - Copies itself to your chosen home folder (self-copy)
 - Creates a scheduled task for automatic syncing (persistence)
