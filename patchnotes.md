@@ -1,5 +1,15 @@
 # Patch Notes — LRGEX Restore
 
+## v1.4.2 — STALE root cause fix
+
+### Scheduled task now catches up on missed runs
+- Task uses `StartWhenAvailable=true` — if PC was off/asleep at the scheduled time, the sync runs immediately on wake instead of being skipped entirely
+- This was the ROOT CAUSE of false STALE warnings on machines that sleep overnight
+
+### STALE threshold doubled
+- Grace period is now 2x the sync interval (48h for daily sync) — tolerates normal scheduling delays without false alarms
+- STALE only shows when sync genuinely hasn't run for 2+ full cycles
+
 ## v1.4.1 — First-run UX + defaults
 
 ### First-run setup polished
