@@ -3,6 +3,7 @@
 <img src="assets/logo.png" alt="LRGEX Logo" width="220">
 
 # LRGEX Restore
+Your Windows folders. Remembered.
 
 **Version 1.4.0**
 
