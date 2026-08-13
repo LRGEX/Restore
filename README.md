@@ -88,8 +88,7 @@ Hours of progress and years of customization disappear because Windows doesn't p
 1. Download `LRGEXRestore.exe`
 2. Run it — pick a **home folder** inside your cloud service (OneDrive, Google Drive, etc.) so your files survive a format. Local folder works too, but won't survive a format.
 3. Open the app from the home folder
-4. Go to **Tools → Right-Click Sync** to enable the right-click menu
-5. Right-click any folder you want to protect — select **"Add to LRGEX Restore"**
+4. Right-click any folder you want to protect — select **"Add to LRGEX Restore"** (menu is enabled automatically; toggle via Tools → Right-Click Sync)
 
 Your folders are now backed up continuously.
 
