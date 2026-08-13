@@ -1150,7 +1150,7 @@ Failed: {}", failures.join(", ")));
             .and_then(|t| t.elapsed().ok())
             .map(|e| (e.as_secs() / 3600) as i32)
             .unwrap_or(999);
-        let sync_stale = sync_age_hours > cfg.sync_interval_minutes / 60;
+        let sync_stale = sync_age_hours > (cfg.sync_interval_minutes / 60) * 2;
         for j in &cfg.junctions {
             let leaf = std::path::Path::new(&j.source_path)
                 .file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();

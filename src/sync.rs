@@ -911,26 +911,82 @@ pub fn register_sync_task(interval_minutes: i32) -> bool {
         None => return false,
     };
     let exe = home.join("LRGEXRestore.exe");
-    let task_cmd = format!("\"{}\" -sync", exe.to_string_lossy());
+    let exe_str = exe.to_string_lossy();
 
-    // schtasks /SC MINUTE max is 1439, /SC HOURLY max is 23.
-    // Pick the right schedule type based on interval size.
-    let (schedule, modifier) = if interval_minutes >= 1440 {
-        // 24+ hours: MINUTE max is 1439, use DAILY instead
-        let days = (interval_minutes / 1440).max(1);
-        ("DAILY", days.to_string())
+    // XML task definition — uses StartWhenAvailable=true so missed runs
+    // (PC off/asleep) are caught up on wake. This is the ROOT FIX for
+    // stale backups on machines that sleep at the scheduled time.
+    let interval_xml = if interval_minutes >= 60 {
+        format!("PT{}H", interval_minutes / 60)
     } else {
-        // Under 24 hours: MINUTE with exact precision
-        ("MINUTE", interval_minutes.to_string())
+        format!("PT{}M", interval_minutes.max(1))
     };
 
-    match Command::new("schtasks.exe")
+    // Escape XML special chars in the exe path.
+    let exe_escaped = exe_str
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;");
+
+    let xml = format!(
+        r#"<?xml version="1.0"?>
+<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <RegistrationInfo>
+    <Description>LRGEX Restore automatic backup sync</Description>
+  </RegistrationInfo>
+  <Triggers>
+    <TimeTrigger>
+      <Repetition>
+        <Interval>{interval}</Interval>
+        <StopAtDurationEnd>false</StopAtDurationEnd>
+      </Repetition>
+      <StartBoundary>2026-01-01T00:00:00</StartBoundary>
+      <Enabled>true</Enabled>
+    </TimeTrigger>
+  </Triggers>
+  <Principals>
+    <Principal id="Author">
+      <LogonType>InteractiveToken</LogonType>
+      <RunLevel>LeastPrivilege</RunLevel>
+    </Principal>
+  </Principals>
+  <Settings>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+    <AllowHardTerminate>true</AllowHardTerminate>
+    <StartWhenAvailable>true</StartWhenAvailable>
+    <RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable>
+    <AllowStartOnDemand>true</AllowStartOnDemand>
+    <Enabled>true</Enabled>
+    <Hidden>false</Hidden>
+    <RunOnlyIfIdle>false</RunOnlyIfIdle>
+    <WakeToRun>false</WakeToRun>
+    <ExecutionTimeLimit>PT2H</ExecutionTimeLimit>
+    <Priority>7</Priority>
+  </Settings>
+  <Actions Context="Author">
+    <Exec>
+      <Command>{exe}</Command>
+      <Arguments>-sync</Arguments>
+    </Exec>
+  </Actions>
+</Task>"#,
+        interval = interval_xml,
+        exe = exe_escaped
+    );
+
+    let xml_path = std::env::temp_dir().join("lrgex-task.xml");
+    if std::fs::write(&xml_path, &xml).is_err() {
+        return false;
+    }
+
+    let result = match Command::new("schtasks.exe")
         .args([
             "/Create",
+            "/XML", &xml_path.to_string_lossy(),
             "/TN", "LRGEX-Restore-Rust",
-            "/TR", &task_cmd,
-            "/SC", schedule,
-            "/MO", &modifier,
             "/F",
         ])
         .creation_flags(0x08000000u32)
@@ -938,7 +994,9 @@ pub fn register_sync_task(interval_minutes: i32) -> bool {
     {
         Ok(out) => out.status.success(),
         Err(_) => false,
-    }
+    };
+    let _ = std::fs::remove_file(&xml_path);
+    result
 }
 // ==================== SAVE-ID MIGRATION ====================
 
