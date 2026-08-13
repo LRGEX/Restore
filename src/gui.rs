@@ -762,6 +762,16 @@ pub fn run() {
     });
     update_rc_label(&app);
 
+    // First launch from home: auto-enable right-click (flag set by setup_home).
+    let rc_flag = config::data_dir().join("enable-rc");
+    if rc_flag.exists() {
+        let _ = std::fs::remove_file(&rc_flag);
+        if !is_rightclick_enabled() {
+            toggle_rightclick(true);
+            update_rc_label(&app);
+        }
+    }
+
     // --- Browse ---
     // Runs on background thread to avoid rfd dialogs appearing behind Slint window
     {
@@ -1822,6 +1832,26 @@ RECOMMENDED: a folder inside a cloud service (OneDrive, Google Drive, etc.) so y
                     let _ = std::fs::write(&cfg_path, data);
                 }
             }
+
+            // Clean up any stray .lrgex created in the ORIGINAL location (Desktop/Downloads).
+            let orig_lrgex = config::script_dir().join(".lrgex");
+            if orig_lrgex != home.join(".lrgex") {
+                let _ = std::fs::remove_dir_all(&orig_lrgex);
+            }
+
+            // Flag: tell the new exe (launching from home) to enable right-click by default.
+            let _ = std::fs::write(home.join(".lrgex").join("enable-rc"), "");
+
+            // Tell the user where to find the app.
+            rfd::MessageDialog::new()
+                .set_title("Setup Complete")
+                .set_description(&format!(
+                    "LRGEX Restore is now installed at:\n{}\n\nOpen it from there.\n\nYou can delete this copy ({}).",
+                    home.display(),
+                    exe.display()
+                ))
+                .set_buttons(rfd::MessageButtons::Ok)
+                .show();
 
             let _ = std::process::Command::new(&dest).spawn();
         }

@@ -27,16 +27,16 @@ pub struct Config {
     pub max_versions: i32,
 }
 
-fn default_interval() -> i32 { 120 }
-fn default_max_versions() -> i32 { 5 }
+fn default_interval() -> i32 { 1440 }
+fn default_max_versions() -> i32 { 2 }
 
 impl Default for Config {
     fn default() -> Self {
         Config {
             junctions: vec![],
-            sync_interval_minutes: 120,
+            sync_interval_minutes: 1440,
             excluded_names: vec![],
-            max_versions: 5,
+            max_versions: 2,
         }
     }
 }
@@ -146,7 +146,8 @@ pub fn load_config() -> Config {
 }
 
 pub fn is_home() -> bool {
-    data_dir().join("home").exists()
+    // Check WITHOUT creating .lrgex (prevents stray folder on Desktop/Downloads).
+    script_dir().join(".lrgex").join("home").exists()
 }
 
 const REG_PATH: &str = r"SOFTWARE\LRGEX\Restore";

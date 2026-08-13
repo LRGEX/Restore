@@ -1,5 +1,20 @@
 # Patch Notes — LRGEX Restore
 
+## v1.4.1 — First-run UX + defaults
+
+### First-run setup polished
+- No stray `.lrgex` folder on Desktop/Downloads during setup (check without creating)
+- "Setup Complete" message tells user exactly where the app was installed
+- Stray `.lrgex` from original location cleaned up after copy to home
+
+### Right-click ON by default
+- New installs get the right-click context menu automatically (no Tools toggle needed)
+- User can still disable it via Tools → Right-Click Sync
+
+### New defaults
+- Sync interval: 1440 minutes (24 hours) — was 120
+- Max versions: 2 — was 5
+
 ## v1.4.0 — Self-healing + GPL + STALE fix
 
 ### Self-healing (move folder anywhere)
