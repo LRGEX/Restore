@@ -109,6 +109,22 @@ Every folder goes back to its exact original path.
 - Windows 10/11
 - A cloud service recommended (survives a format). Local folder works but won't survive a format.
 
+## Windows Defender false positive
+
+Windows Defender may flag LRGEX Restore as a false positive (`Trojan:Win32/Bearfoos.B!ml` / `Behavior:Win32/Persistence.A!ml`). **This is a confirmed false positive.** The exe is [verified clean on VirusTotal](https://www.virustotal.com/gui/file/efb323d25fe654b7d7f0456c2647b422d6ee8828f405fee9defa8f2ee47566ef/detection) — 0 detections across 70+ engines. Defender's machine learning flags the app because it:
+
+- Copies itself to your chosen home folder (self-copy)
+- Creates a scheduled task for automatic syncing (persistence)
+- Registers a right-click context menu (registry persistence)
+
+These are the app's core features, not malware behavior. The source code is fully open under GPL-3.0.
+
+**To fix:** add the home folder to Defender exclusions:
+
+1. **Settings → Privacy & Security → Windows Security → Virus & threat protection**
+2. **Manage settings → Add or remove exclusions → Add an exclusion → Folder**
+3. Select your LRGEX Restore home folder
+
 ---
 
 ## License
