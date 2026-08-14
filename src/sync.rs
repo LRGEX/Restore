@@ -7,17 +7,113 @@ use std::process::Command;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicBool, Ordering};
 
+// M6: UNREADABLE is NOT empty. Auto-restore only fires on a CONFIRMED empty
+// folder; a transient ACL/read error must not "restore over" data we cannot see.
+// M6: UNREADABLE is NOT empty. Auto-restore only fires on a CONFIRMED empty
+// folder; a transient ACL/read error must not "restore over" data we cannot see.
 pub fn is_dir_empty(path: &str) -> bool {
     match std::fs::read_dir(path) {
         Ok(mut entries) => entries.next().is_none(),
-        Err(_) => true,
+        Err(_) => false, // unknown ≠ empty
+    }
+}
+
+/// L7: orphaned temp-file sweep — PID-suffixed temps from killed compressions.
+/// Runs from BOTH the GUI and -sync startup (headless machines never open the GUI,
+/// and the task's 2h ExecutionTimeLimit can kill a mega-folder sync mid-compress).
+pub fn sweep_orphaned_temps() {
+    if let Ok(entries) = std::fs::read_dir(std::env::temp_dir()) {
+        let current_pid = std::process::id();
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.starts_with("lrgex_") && name.ends_with(".tar.zst.tmp") {
+                // Parse PID from filename: lrgex_<PID>_<leaf>.tar.zst.tmp
+                if let Some(pid_str) = name.strip_prefix("lrgex_") {
+                    if let Some(pid_end) = pid_str.find('_') {
+                        if let Ok(pid) = pid_str[..pid_end].parse::<u32>() {
+                            if pid != current_pid && !crate::synclog::is_pid_alive(pid) {
+                                let _ = std::fs::remove_file(entry.path());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// ==================== C3: GLOBAL MUTATION LOCK ====================
+// Every mutating entry point (scheduled -sync, GUI threads, -link, -autorestore)
+// must hold the same named mutex. The old design only locked -sync mode, so a
+// GUI restore running during a scheduled sync (StartWhenAvailable fires on wake
+// — exactly when users sit down to restore) could interleave the swap steps and
+// destroy the user's pre-restore data. Kernel-owned: released on PID death.
+
+pub struct PairLock {
+    _handle: windows_sys::Win32::Foundation::HANDLE, // kept alive, released on drop/death
+}
+
+/// Acquire the global mutation lock. Waits up to `timeout_ms` for a concurrent
+/// operation to finish. Returns None if still busy (caller reports/aborts —
+/// NEVER proceeds without the lock).
+pub fn acquire_pair_lock(timeout_ms: u32) -> Option<PairLock> {
+    use windows_sys::Win32::System::Threading::{CreateMutexW, WaitForSingleObject};
+    use windows_sys::Win32::Foundation::{CloseHandle, WAIT_OBJECT_0};
+    use std::os::windows::ffi::OsStrExt;
+    let name: Vec<u16> = std::ffi::OsStr::new("LRGEXRestoreSyncLock")
+        .encode_wide().chain(std::iter::once(0)).collect();
+    unsafe {
+        let h = CreateMutexW(std::ptr::null(), 0, name.as_ptr());
+        if h.is_null() { return None; }
+        let r = WaitForSingleObject(h, timeout_ms);
+        if r == WAIT_OBJECT_0 {
+            Some(PairLock { _handle: h })
+        } else {
+            // Still busy after timeout — abort, do NOT proceed unlocked.
+            CloseHandle(h);
+            None
+        }
+    }
+}
+
+impl Drop for PairLock {
+    fn drop(&mut self) {
+        unsafe {
+            // MUST release before closing — Windows mutexes stay owned by the
+            // acquiring thread until ReleaseMutex or thread death. Without this,
+            // a finished GUI operation would block every future -sync forever.
+            windows_sys::Win32::System::Threading::ReleaseMutex(self._handle);
+            windows_sys::Win32::Foundation::CloseHandle(self._handle);
+        }
     }
 }
 
 // ==================== COMPRESSION (tar + zstd) ====================
 
 const BIG_FILE: u64 = 8 * 1024 * 1024; // stream these instead of preloading
-const BATCH: usize = 2048;             // ~8 MB resident for 4 KB files
+const BATCH: usize = 2048;             // max files per batch
+const BATCH_BYTES: u64 = 64 * 1024 * 1024; // M1: cap resident bytes — 2048 x 1MB save
+                                       // files would OOM at 2GB if capped by count alone
+
+/// M1: batches capped by BOTH count and total bytes — preloaded files stay
+/// bounded no matter how large the individual files are.
+fn chunk_by_bytes(files: &[FileEnt], max_bytes: u64, max_count: usize) -> Vec<&[FileEnt]> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < files.len() {
+        let start = i;
+        let mut bytes = 0u64;
+        while i < files.len() && (i - start) < max_count {
+            if bytes + files[i].size.min(BIG_FILE) > max_bytes && i > start {
+                break;
+            }
+            bytes += files[i].size.min(BIG_FILE); // only small files preload
+            i += 1;
+        }
+        out.push(&files[start..i]);
+    }
+    out
+}
 
 pub struct FileEnt {
     pub path: PathBuf,
@@ -28,18 +124,34 @@ pub struct FileEnt {
 /// SINGLE WALK — replaces compute_stats + collect_files.
 /// Returns (entries, total_bytes, count). Uses DirEntry::metadata() which on
 /// Windows is served from the directory enumeration cache (no extra syscall).
+/// M2: walk_tree now returns unreadable-subtree failures so sync can WARN
+/// instead of silently producing an incomplete backup that looks successful.
 pub fn walk_tree(base: &Path, excluded: &[String]) -> (Vec<FileEnt>, u64, usize) {
     let mut out = Vec::with_capacity(4096);
     let mut total = 0u64;
-    walk_inner(base, base, excluded, &mut out, &mut total);
+    let mut failed_dirs: Vec<String> = Vec::new();
+    walk_inner(base, base, excluded, &mut out, &mut total, &mut failed_dirs);
+    if !failed_dirs.is_empty() {
+        let mut msg = String::from("[WALK-WARN] unreadable subfolders EXCLUDED from backup:");
+        for d in failed_dirs.iter().take(20) {
+            msg.push_str(&format!("\n  {}", d));
+        }
+        if failed_dirs.len() > 20 {
+            msg.push_str(&format!("\n  ... and {} more", failed_dirs.len() - 20));
+        }
+        crate::synclog::write(&msg);
+    }
     let count = out.len();
     (out, total, count)
 }
 
-fn walk_inner(base: &Path, current: &Path, excluded: &[String], out: &mut Vec<FileEnt>, total: &mut u64) {
+fn walk_inner(base: &Path, current: &Path, excluded: &[String], out: &mut Vec<FileEnt>, total: &mut u64, failed: &mut Vec<String>) {
     let entries = match std::fs::read_dir(current) {
         Ok(e) => e,
-        Err(_) => return,
+        Err(_) => {
+            failed.push(current.to_string_lossy().to_string());
+            return;
+        }
     };
     for entry in entries.flatten() {
         let name = entry.file_name();
@@ -51,7 +163,7 @@ fn walk_inner(base: &Path, current: &Path, excluded: &[String], out: &mut Vec<Fi
 
         let path = entry.path();
         if ft.is_dir() {
-            walk_inner(base, &path, excluded, out, total);
+            walk_inner(base, &path, excluded, out, total, failed);
         } else {
             let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
             *total += size;
@@ -419,22 +531,39 @@ mod tests {
 
     #[test]
     fn test_detect_change_locked_file_size_only() {
-        // hash=0 on one side (locked at manifest build) => compare by size only.
-        // A locked file must NOT read as "changed" forever.
-        let dir = std::env::temp_dir().join(format!("lrgex_manifest_4_{}", std::process::id()))
+        // C1 heal semantics:
+        // (a) stored h=0 (was locked at manifest build) + readable now => CHANGED
+        //     (heal: re-backup once to learn the content — un-blinds permanently).
+        // (b) stored real hash + currently locked => UNCHANGED (size-only compare;
+        //     a permanently-locked file must not loop re-backups forever).
+        let dir = std::env::temp_dir()
+            .join(format!("lrgex_manifest_4_{}", std::process::id()))
             .join("m4");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let f = dir.join("locked.db");
         std::fs::write(&f, b"0123456789").unwrap();
 
+        // (a) heal: stored h=0, readable now => changed
         let mut stored = compute_manifest(&[ent(&f, &dir)]);
-        stored[0].h = 0; // simulate: was locked when the manifest was built
-
-        // Content of the file may differ now — but hash was never recorded,
-        // so size-only comparison says "unchanged".
+        stored[0].h = 0;
         let (changed, _) = detect_change(&stored, &[ent(&f, &dir)]);
-        assert!(!changed, "Locked file with same size must NOT read as changed");
+        assert!(changed, "stored-unknown + readable-now must HEAL (re-backup)");
+
+        // (b) locked now: stored real hash (recorded BEFORE the lock), current
+        // file unreadable (exclusive handle => hash_file None => c.h=0) => unchanged.
+        #[cfg(target_os = "windows")]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            let stored2 = compute_manifest(&[ent(&f, &dir)]); // real hash, file still readable
+            assert_ne!(stored2[0].h, 0, "precondition: stored hash must be real");
+            let _guard = std::fs::OpenOptions::new()
+                .read(true).share_mode(0) // exclusive — nobody else can open it
+                .open(&f).expect("open exclusive");
+            let current_files = vec![ent(&f, &dir)];
+            let (changed2, _) = detect_change(&stored2, &current_files);
+            assert!(!changed2, "currently-locked file (same size) must NOT loop re-backups");
+        }
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -527,13 +656,13 @@ mod tests {
         // 1) First backup (force first run semantics: no backup exists yet)
         let (ok, msg) = sync_pair_to_cloud(&src_str, &[], 2, false);
         assert!(ok, "first backup failed: {}", msg);
-        assert!(config::backup_file_for(&leaf).exists(), "backup archive must exist");
+        assert!(config::backup_file_for(&src_str).exists(), "backup archive must exist");
 
         // 2) Wipe source (simulates format / restore scenario)
         std::fs::remove_dir_all(&src).unwrap();
 
         // 3) Restore from archive
-        let archive = config::backup_file_for(&leaf);
+        let archive = config::backup_file_for(&src_str);
         let (ok, msg) = decompress_archive(&archive, &src);
         assert!(ok, "restore failed: {}", msg);
 
@@ -552,9 +681,9 @@ mod tests {
             "Same-size edit after restore MUST trigger a re-backup — got: {}", msg);
 
         // Cleanup: remove this test's artifacts from the shared .lrgex
-        let _ = std::fs::remove_file(config::backup_file_for(&leaf));
-        let _ = std::fs::remove_file(config::sidecar_for(&leaf));
-        let _ = std::fs::remove_dir_all(config::trash_path_for(&leaf));
+        let _ = std::fs::remove_file(config::backup_file_for(&src_str));
+        let _ = std::fs::remove_file(config::sidecar_for(&src_str));
+        let _ = std::fs::remove_dir_all(config::trash_path_for(&src_str));
         let _ = std::fs::remove_dir_all(&src);
     }
 }
@@ -609,14 +738,14 @@ pub fn compress_folder(
     };
     let threads = std::thread::available_parallelism().map(|n| n.get() as u32).unwrap_or(4);
     let _ = encoder.multithread(threads);
-    let _ = encoder.include_checksum(false);
+    let _ = encoder.include_checksum(true); // H3: frame checksum — bit rot fails LOUD, not silently
     let mut builder = tar::Builder::new(encoder.auto_finish());
 
     let t_append = std::time::Instant::now();
     let mut processed = 0usize;
     let mut skipped: Vec<String> = Vec::new();
 
-    for batch in files.chunks(BATCH) {
+    for batch in chunk_by_bytes(&files, BATCH_BYTES, BATCH) {
         let loaded: Vec<Option<std::io::Result<Vec<u8>>>> = batch
             .par_iter()
             .map(|e| {
@@ -715,6 +844,13 @@ pub fn decompress_archive(archive: &Path, dest: &Path) -> (bool, String) {
         .join(format!(".lrgex_restore_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&temp_dir);
     let _ = std::fs::create_dir_all(&temp_dir);
+    // M5: mark staging HIDDEN + TEMPORARY (attrib) — OneDrive/Syncthing watchers
+    // skip hidden temp dirs, so a restore inside a synced tree stops re-uploading
+    // gigabytes of transient extraction data. No new deps: attrib is in-box.
+    let _ = std::process::Command::new("attrib")
+        .args(["+h", "+t", temp_dir.to_string_lossy().as_ref()])
+        .creation_flags(0x08000000u32)
+        .output();
 
     let arch_size = std::fs::metadata(archive).map(|m| m.len()).unwrap_or(0);
     let leaf_name = archive.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
@@ -756,7 +892,27 @@ pub fn decompress_archive(archive: &Path, dest: &Path) -> (bool, String) {
             crate::synclog::write_progress("");
             let ec = std::fs::read_dir(&temp_dir).map(|d| d.count()).unwrap_or(0);
             crate::synclog::write(&format!("  [DECOMPRESS] unpack OK - {} entries, {} bytes archive", ec, arch_size));
-            let backup_name = dest.with_extension("lrgex_bak");
+            // M4: PID-suffixed bak name is collision-proof; a crash-recovery bak
+            // (stale *.lrgex_bak.* + dest missing) is RECOVERED, never deleted.
+            if let Some(parent) = dest.parent() {
+                let name = dest.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+                if !dest.exists() {
+                    if let Ok(entries) = std::fs::read_dir(parent) {
+                        for entry in entries.flatten() {
+                            let en = entry.file_name().to_string_lossy().to_string();
+                            if en.starts_with(&format!("{}.lrgex_bak.", name)) {
+                                let _ = std::fs::rename(entry.path(), dest);
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            let backup_name = dest.parent()
+                .map(|p| p.join(format!("{}.lrgex_bak.{}",
+                    dest.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default(),
+                    std::process::id())))
+                .unwrap_or_else(|| dest.with_extension("lrgex_bak"));
             let _ = std::fs::remove_dir_all(&backup_name);
             if dest.exists() {
                 if std::fs::rename(dest, &backup_name).is_err() {
@@ -888,8 +1044,18 @@ fn detect_change(stored: &[FileMeta], current_files: &[FileEnt]) -> (bool, Vec<F
             None => return (true, current), // file added
             Some(s) => {
                 if s.s != c.s { return (true, current); } // size differs
-                // hash=0 on either side = locked/unreadable — size-only compare
-                if s.h != 0 && c.h != 0 && s.h != c.h {
+                // C1 heal rule: stored hash unknown (file was locked at some past
+                // backup) but readable NOW — we never learned its content, so
+                // re-backup once. This is what un-blinds detection permanently:
+                // the manifest self-heals instead of staying h=0 forever.
+                if s.h == 0 && c.h != 0 {
+                    crate::synclog::write("  [HEAL] previously-locked file now readable — re-backup");
+                    return (true, current);
+                }
+                // Currently locked (h=0 now) — size match is all we can verify.
+                // Prevents a permanently-locked file from looping re-backups.
+                if s.h != 0 && c.h == 0 { continue; }
+                if s.h != c.h {
                     return (true, current); // content differs (same size!)
                 }
             }
@@ -949,16 +1115,25 @@ pub fn sync_pair_to_cloud(source: &str, excluded: &[String], max_versions: i32, 
         return (false, "source does not exist".into());
     }
 
+    // C3: hold the global mutation lock for the whole operation.
+    let _pair_lock = match acquire_pair_lock(60_000) {
+        Some(l) => l,
+        None => return (false, "another LRGEX operation is running — try again in a moment".into()),
+    };
+
     let leaf = Path::new(source).file_name()
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_default();
 
     // Backup paths
-    let backup_7z = config::backup_file_for(&leaf);
-    let sidecar = config::sidecar_for(&leaf);
-    let backup_dir = config::backup_dir_for(&leaf);
+    let backup_7z = config::backup_file_for(source);
+    let sidecar = config::sidecar_for(source);
+    let backup_dir = config::backup_dir_for(source);
     let _ = std::fs::create_dir_all(&backup_dir);
-    let versions_folder = config::trash_path_for(&leaf);
+    let versions_folder = config::trash_path_for(source);
+
+    // C2: one-time migration — rename old leaf-only dirs to keyed dirs (no-op if already keyed)
+    config::migrate_pair_key(source);
 
     // Migration: old root-level backup → delete (will re-compress to backup/ on next sync)
     let old_root_backup = config::script_dir().join(format!("{}.tar.zst", leaf));
@@ -968,11 +1143,21 @@ pub fn sync_pair_to_cloud(source: &str, excluded: &[String], max_versions: i32, 
         let _ = std::fs::remove_file(&old_root_sidecar);
     }
 
-    // Migration: if old raw backup folder exists, compress it
+    // C4: legacy raw-folder migration — compress to TEMP, rename into place, and
+    // ONLY delete the raw folder on verified success. The raw folder may be the
+    // user's ONLY copy; a failed compress + unconditional delete = total loss.
     let old_backup_folder = config::script_dir().join(&leaf);
     if old_backup_folder.is_dir() && !backup_7z.exists() {
-        let _ = compress_folder(&old_backup_folder, &backup_7z, excluded, None); // (bool, Vec) — ignore result for migration
-        let _ = std::fs::remove_dir_all(&old_backup_folder);
+        let tmp = std::env::temp_dir()
+            .join(format!("lrgex_migrate_{}_{}.tar.zst.tmp", std::process::id(), leaf));
+        let (ok, _) = compress_folder(&old_backup_folder, &tmp, excluded, None);
+        if ok && std::fs::rename(&tmp, &backup_7z).is_ok() {
+            let _ = std::fs::remove_dir_all(&old_backup_folder);
+        } else {
+            let _ = std::fs::remove_file(&tmp);
+            crate::synclog::write(&format!(
+                "  [MIGRATE-FAIL] kept raw folder for {} (compress failed)", leaf));
+        }
     }
 
     // Change detection — two tiers:
@@ -1009,7 +1194,8 @@ pub fn sync_pair_to_cloud(source: &str, excluded: &[String], max_versions: i32, 
             create_snapshot(&backup_7z, &versions_folder);
             snapshotted = true;
         }
-        clean_versions(&versions_folder, max_versions as usize);
+        // L1: clean_versions runs AFTER the successful swap below — a failed
+        // compress must not burn the oldest snapshot slot.
 
         // Rule 3 (consistency): manifest reflects files that WERE archived.
         // Computed ONCE (possibly reused from detection), before compress consumes `walked`.
@@ -1030,13 +1216,17 @@ pub fn sync_pair_to_cloud(source: &str, excluded: &[String], max_versions: i32, 
                     meta.h = 0;
                 }
             }
-            let _ = std::fs::remove_file(&backup_7z);
+            // M3: NO remove_file first — std::fs::rename on Windows replaces an
+            // existing file atomically (MOVEFILE_REPLACE_EXISTING). The old
+            // remove+rename pair left a crash window with NO live archive.
             if std::fs::rename(&temp_7z, &backup_7z).is_ok() {
+                clean_versions(&versions_folder, max_versions as usize); // L1: after success
                 write_stored_manifest(&sidecar, &m);
             } else {
                 // Rename failed (OneDrive lock?) — try copy + delete
                 if std::fs::copy(&temp_7z, &backup_7z).is_ok() {
                     let _ = std::fs::remove_file(&temp_7z);
+                    clean_versions(&versions_folder, max_versions as usize); // L1: after success
                     write_stored_manifest(&sidecar, &m);
                 } else {
                     let _ = std::fs::remove_file(&temp_7z);
@@ -1075,7 +1265,8 @@ pub fn pre_check_restore(paths: &[String]) -> Vec<(String, String)> {
         let leaf = std::path::Path::new(path).file_name()
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_default();
-        let backup = config::backup_file_for(&leaf);
+        config::migrate_pair_key(path); // C2: pre-check must see migrated paths too
+        let backup = config::backup_file_for(path);
 
         // 1. Backup archive exists?
         if !backup.exists() {
@@ -1114,11 +1305,19 @@ pub fn pre_check_restore(paths: &[String]) -> Vec<(String, String)> {
 }
 
 pub fn restore_pair_from_cloud(source: &str) -> (bool, String) {
+    // C3: hold the global mutation lock for the whole operation.
+    let _pair_lock = match acquire_pair_lock(120_000) {
+        Some(l) => l,
+        None => return (false, "another LRGEX operation is running — try again in a moment".into()),
+    };
     let leaf = Path::new(source).file_name()
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_default();
 
-    let backup_7z = config::backup_file_for(&leaf);
+    // C2: migrate BEFORE resolving keyed paths — a fresh reinstall may run
+    // restore before any sync ever fires (OneDrive carried the old leaf dirs).
+    config::migrate_pair_key(source);
+    let backup_7z = config::backup_file_for(source);
 
     // Try .tar.zst first (new format)
     if backup_7z.exists() {
@@ -1211,6 +1410,11 @@ pub fn sync_all_pairs() {
 
 /// Restore a specific snapshot version to the source location
 pub fn restore_snapshot(snapshot_dir: &Path, source: &str) -> (bool, String) {
+    // C3: hold the global mutation lock for the whole operation.
+    let _pair_lock = match acquire_pair_lock(120_000) {
+        Some(l) => l,
+        None => return (false, "another LRGEX operation is running — try again in a moment".into()),
+    };
     // Look for .tar.zst file in the snapshot directory
     if let Ok(entries) = std::fs::read_dir(snapshot_dir) {
         for entry in entries.flatten() {
@@ -1267,11 +1471,18 @@ pub fn register_sync_task(interval_minutes: i32) -> bool {
     // XML task definition — uses StartWhenAvailable=true so missed runs
     // (PC off/asleep) are caught up on wake. This is the ROOT FIX for
     // stale backups on machines that sleep at the scheduled time.
-    let interval_xml = if interval_minutes >= 60 {
-        format!("PT{}H", interval_minutes / 60)
-    } else {
-        format!("PT{}M", interval_minutes.max(1))
-    };
+    // L3: exact duration — integer-dividing to hours silently truncated
+    // (90min became PT1H=60min). ISO 8601: days go BEFORE the T (P1DT2H3M).
+    let m = interval_minutes.max(1) as u64;
+    let (d, h, min) = (m / 1440, (m % 1440) / 60, m % 60);
+    let mut parts: Vec<String> = Vec::new();
+    if d > 0 { parts.push(format!("{}D", d)); }
+    let mut t = String::new();
+    if h > 0 { t.push_str(&format!("{}H", h)); }
+    if min > 0 { t.push_str(&format!("{}M", min)); }
+    if !t.is_empty() { parts.push(t); }
+    if parts.is_empty() { parts.push("0M".into()); }
+    let interval_xml = format!("P{}", parts.join("T"));
 
     // Escape XML special chars in the exe path.
     let exe_escaped = exe_str

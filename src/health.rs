@@ -28,7 +28,12 @@ pub fn write_status(ok: i32, fail: i32, restored: i32, names: &[String]) {
         restored_names: names.join(", "),
     };
     if let Ok(data) = serde_json::to_string(&s) {
-        let _ = std::fs::write(status_path(), data);
+        // L6: atomic write (temp + rename) — a torn sync-status.json made the
+        // health lamp read stale/default forever.
+        let tmp = status_path().with_extension("json.tmp");
+        if std::fs::write(&tmp, data).is_ok() {
+            let _ = std::fs::rename(&tmp, status_path());
+        }
     }
 }
 
@@ -43,8 +48,23 @@ pub fn task_exists() -> bool {
     }
 }
 
-/// Is the task currently running?
+/// Is the task currently running? (M8: locale-INDEPENDENT — check the task's
+/// running PID via XML-free query instead of parsing localized /V text.)
 fn task_running() -> bool {
+    // PowerShell resolves the locale-independent LastTaskResult/State via COM:
+    // faster and reliable on non-English Windows. Fall back to the old parse.
+    let output = std::process::Command::new("powershell.exe")
+        .args(["-NoProfile", "-Command",
+            "(Get-ScheduledTask -TaskName 'LRGEX-Restore-Rust' -ErrorAction SilentlyContinue).State -eq 'Running'"])
+        .creation_flags(0x08000000u32)
+        .output();
+    if let Ok(out) = output {
+        if out.status.success() {
+            let text = String::from_utf8_lossy(&out.stdout).trim().to_lowercase();
+            return text == "true";
+        }
+    }
+    // Fallback: legacy localized parse (English Windows) — best effort.
     let output = std::process::Command::new("schtasks.exe")
         .args(&["/Query", "/TN", "LRGEX-Restore-Rust", "/FO", "LIST", "/V"])
         .creation_flags(0x08000000u32)

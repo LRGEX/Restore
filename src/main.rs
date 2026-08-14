@@ -31,20 +31,12 @@ fn main() {
     }
     if sync_mode {
         // Mutex prevents concurrent sync processes from stacking up
-        use windows_sys::Win32::System::Threading::CreateMutexW;
-        use windows_sys::Win32::Foundation::GetLastError;
-        use std::os::windows::ffi::OsStrExt;
-        let sync_mutex: Vec<u16> = std::ffi::OsStr::new("LRGEXRestoreSyncLock")
-            .encode_wide().chain(std::iter::once(0)).collect();
-        unsafe {
-            let handle = CreateMutexW(std::ptr::null(), 0, sync_mutex.as_ptr());
-            if GetLastError() == 183 {
-                return; // Another sync is already running — exit silently
-            }
-            let _ = handle; // keep mutex alive
-        }
+        // C3: per-pair locks now live inside sync_pair_to_cloud/
+        // restore_pair_from_cloud (acquire_pair_lock) — every entry point is
+        // covered, not just this one.
         config::migrate_to_data_dir();
         config::ensure_versions_setup();
+        sync::sweep_orphaned_temps(); // L7: headless machines never launch the GUI
         sync::sync_all_pairs();
         return;
     }
@@ -69,7 +61,8 @@ fn main() {
         if !confirm { return; }
 
         let mut cfg = config::load_config();
-        cfg.junctions.retain(|j| j.source_path != link_path);
+        // L2: normalized dedup — see config::same_path (contracted vs expanded aware)
+        cfg.junctions.retain(|j| !config::same_path(&j.source_path, &link_path));
         cfg.junctions.push(config::Junction { source_path: link_path.clone(), auto_restore: true, created: synclog::timestamp(), is_game: false });
         config::save_config(&cfg);
         let (ok, reason) = sync::sync_pair_to_cloud(&link_path, &cfg.excluded_names, cfg.max_versions, true);

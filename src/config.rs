@@ -81,14 +81,18 @@ pub fn config_path() -> PathBuf {
 }
 
 /// Save config with path contraction (absolute → portable).
-pub fn save_config(cfg: &Config) {
+pub fn save_config(cfg: &Config) -> bool {
+    // L5: returns success — a silently-dropped junction (full disk, OneDrive
+    // lock) was invisible to the user. Callers that ignore the result still
+    // compile (bool is inert), GUI sites now surface the failure.
     let path = config_path();
     let mut cfg = cfg.clone();
     for j in &mut cfg.junctions {
         j.source_path = crate::pathutil::contract(&j.source_path);
     }
-    if let Ok(data) = serde_json::to_string_pretty(&cfg) {
-        let _ = std::fs::write(&path, data);
+    match serde_json::to_string_pretty(&cfg) {
+        Ok(data) => std::fs::write(&path, data).is_ok(),
+        Err(_) => false,
     }
 }
 
@@ -109,7 +113,10 @@ pub fn load_config() -> Config {
         j.source_path = crate::pathutil::expand(&j.source_path);
         let lower = j.source_path.to_lowercase();
         let sep = std::path::MAIN_SEPARATOR;
-        let prefix = format!("c:{}users{}", sep, sep);
+        // L4: heal on the ACTUAL system drive (%SystemDrive%, not hardcoded c:) —
+        // Windows installed on D:/E: previously never healed after a reinstall.
+        let sys_drive = std::env::var("SystemDrive").unwrap_or_else(|_| "C:".into());
+        let prefix = format!("{}{}users{}", sys_drive.to_lowercase(), sep, sep);
         if lower.starts_with(&prefix) && !current_user.is_empty() {
             let after_prefix = &j.source_path[prefix.len()..];
             if let Some(bs) = after_prefix.find(sep) {
@@ -210,18 +217,86 @@ pub fn ensure_versions_setup() {
     }
 }
 
-pub fn trash_path_for(leaf: &str) -> PathBuf {
-    trash_base().join(leaf)
+// ==================== PAIR IDENTITY (C2) ====================
+// Backup identity is leaf + short hash of the full (lowercased) source path.
+// Two junctions named "Saves" in different games are DIFFERENT pairs — the old
+// leaf-only keys made them overwrite each other's backups and restore the
+// wrong game's data into the other's folder.
+fn fnv1a_hex(s: &str) -> String {
+    let mut h: u64 = 0xcbf29ce484222325;
+    for b in s.to_lowercase().bytes() {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    format!("{:08x}", (h & 0xFFFF_FFFF) as u32) // 8 hex chars — display-friendly
 }
 
-pub fn backup_dir_for(leaf: &str) -> PathBuf {
-    script_dir().join("backup").join(leaf)
+/// L2: true when two source paths refer to the SAME folder — compares the
+/// EXPANDED, case-folded, trailing-slash-trimmed forms, so contracted config
+/// paths (%APPDATA%\Foo) match picker-expanded ones (C:\Users\X\...\Foo).
+pub fn same_path(a: &str, b: &str) -> bool {
+    let norm = |p: &str| crate::pathutil::expand(p).trim_end_matches(['\\', '/']).to_lowercase();
+    norm(a) == norm(b)
+}
+/// Hash base is the CONTRACTED form (pathutil::contract) — stable across
+/// username changes (the app's core purpose). contract() is idempotent on
+/// already-contracted input (contracting a contracted path is identity).
+pub fn pair_key(source: &str) -> String {
+    let contracted = crate::pathutil::contract(source);
+    let leaf = match Path::new(&contracted).file_name() {
+        Some(n) => n.to_string_lossy().to_string(),
+        None => "pair".into(),
+    };
+    format!("{}_{}", leaf, fnv1a_hex(&contracted))
 }
 
-pub fn backup_file_for(leaf: &str) -> PathBuf {
-    backup_dir_for(leaf).join(format!("{}.tar.zst", leaf))
+/// One-time migration: if the old leaf-only dir exists and the new keyed dir
+/// does not, rename DIR + rename the archive/sidecar FILES inside (they keep
+/// their old <leaf>.* names — the new code expects <key>.*). Idempotent — a
+/// no-op once migrated. Runs from sync AND restore paths (fresh reinstall may
+/// only ever run restore, so both entry points must migrate).
+pub fn migrate_pair_key(source: &str) {
+    let leaf = match Path::new(source).file_name() {
+        Some(n) => n.to_string_lossy().to_string(),
+        None => return,
+    };
+    let key = pair_key(source);
+    if key == leaf { return; }
+    let old_dir = script_dir().join("backup").join(&leaf);
+    let new_dir = script_dir().join("backup").join(&key);
+    if old_dir.is_dir() && !new_dir.exists() {
+        if std::fs::rename(&old_dir, &new_dir).is_ok() {
+            // Rename files inside: <leaf>.tar.zst -> <key>.tar.zst, same for .size
+            let old_arch = new_dir.join(format!("{}.tar.zst", leaf));
+            let new_arch = new_dir.join(format!("{}.tar.zst", key));
+            if old_arch.exists() { let _ = std::fs::rename(&old_arch, &new_arch); }
+            let old_side = new_dir.join(format!("{}.tar.zst.size", leaf));
+            let new_side = new_dir.join(format!("{}.tar.zst.size", key));
+            if old_side.exists() { let _ = std::fs::rename(&old_side, &new_side); }
+        }
+    }
+    // Same for versions
+    let old_v = trash_base().join(&leaf);
+    let new_v = trash_base().join(&key);
+    if old_v.is_dir() && !new_v.exists() {
+        let _ = std::fs::rename(&old_v, &new_v);
+    }
 }
 
-pub fn sidecar_for(leaf: &str) -> PathBuf {
-    backup_dir_for(leaf).join(format!("{}.tar.zst.size", leaf))
+pub fn trash_path_for(source: &str) -> PathBuf {
+    trash_base().join(pair_key(source))
+}
+
+pub fn backup_dir_for(source: &str) -> PathBuf {
+    script_dir().join("backup").join(pair_key(source))
+}
+
+pub fn backup_file_for(source: &str) -> PathBuf {
+    let key = pair_key(source);
+    script_dir().join("backup").join(&key).join(format!("{}.tar.zst", key))
+}
+
+pub fn sidecar_for(source: &str) -> PathBuf {
+    let key = pair_key(source);
+    script_dir().join("backup").join(&key).join(format!("{}.tar.zst.size", key))
 }

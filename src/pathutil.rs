@@ -122,6 +122,14 @@ pub fn expand(path: &str) -> String {
         for (name, guid) in KNOWN_FOLDERS {
             let token = format!("%knownfolder:{}%", name.to_lowercase());
             if let Some(pos) = lower.find(&token) {
+                // M7: fold-length changes (e.g. İ 2→3 bytes) shift indices between
+                // `lower` and the original `result`. Verify the token ACTUALLY sits
+                // at this offset in the original — else skip (never mis-slice).
+                if !result.is_char_boundary(pos)
+                    || !result.is_char_boundary(pos + token.len())
+                    || !result[pos..pos + token.len()].eq_ignore_ascii_case(&token) {
+                    continue;
+                }
                 if let Some(actual) = sh_get_known_folder_path(guid) {
                     result = format!("{}{}{}", &result[..pos], actual, &result[pos + token.len()..]);
                     changed = true;
@@ -136,6 +144,12 @@ pub fn expand(path: &str) -> String {
         for (token, var_name) in ENV_VARS {
             let token_lower = token.to_lowercase();
             if let Some(pos) = lower.find(&token_lower) {
+                // M7: same boundary + verify guard as above.
+                if !result.is_char_boundary(pos)
+                    || !result.is_char_boundary(pos + token.len())
+                    || !result[pos..pos + token.len()].eq_ignore_ascii_case(&token) {
+                    continue;
+                }
                 if let Ok(value) = std::env::var(var_name) {
                     result = format!("{}{}{}", &result[..pos], value, &result[pos + token.len()..]);
                     changed = true;

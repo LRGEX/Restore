@@ -648,25 +648,7 @@ use crate::{config, sync, health, synclog};
 pub fn run() {
     // Startup sweep: clean up orphaned temp files from killed compressions.
     config::migrate_to_data_dir();
-    // Safe — PID suffix identifies dead processes. Prevents temp pile-up.
-    if let Ok(entries) = std::fs::read_dir(std::env::temp_dir()) {
-        let current_pid = std::process::id();
-        for entry in entries.flatten() {
-            let name = entry.file_name().to_string_lossy().to_string();
-            if name.starts_with("lrgex_") && name.ends_with(".tar.zst.tmp") {
-                // Parse PID from filename: lrgex_<PID>_<leaf>.tar.zst.tmp
-                if let Some(pid_str) = name.strip_prefix("lrgex_") {
-                    if let Some(pid_end) = pid_str.find('_') {
-                        if let Ok(pid) = pid_str[..pid_end].parse::<u32>() {
-                            if pid != current_pid && !crate::synclog::is_pid_alive(pid) {
-                                let _ = std::fs::remove_file(entry.path());
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
+    sync::sweep_orphaned_temps();
 
     // First-run: relocate to home folder if needed
     if !config::is_home() {
@@ -790,7 +772,8 @@ pub fn run() {
                 // MessageDialog + config update on background thread (appears on top)
                 std::thread::spawn(move || {
                     let mut cfg = config::load_config();
-                    if !cfg.junctions.iter().any(|j| j.source_path == p) {
+                    // L2: normalized dedup — config::same_path handles contracted/expanded
+                    if !cfg.junctions.iter().any(|j| config::same_path(&j.source_path, &p)) {
                         let leaf = std::path::Path::new(&p).file_name()
                             .map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
                         let ar = rfd::MessageDialog::new()
@@ -836,7 +819,8 @@ pub fn run() {
                     return;
                 }
                 let cfg = config::load_config();
-                if cfg.junctions.iter().any(|j| j.source_path == path) {
+                // L2: normalized dedup
+                if cfg.junctions.iter().any(|j| config::same_path(&j.source_path, &path)) {
                     let leaf_name = std::path::Path::new(&path).file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
                     a.set_status_text(format!("Compressing {}...", leaf_name).into());
                     a.set_operation_running(true);
@@ -1044,7 +1028,8 @@ Failed: {}", failures.join(", ")));
             let mut cfg = config::load_config();
             let i = idx as usize;
             if i >= cfg.junctions.len() { return; }
-            let name = std::path::Path::new(&cfg.junctions[i].source_path)
+            let source_path = cfg.junctions[i].source_path.clone();
+            let name = std::path::Path::new(&source_path)
                 .file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
             let confirm = rfd::MessageDialog::new()
                 .set_title("Confirm Remove")
@@ -1057,10 +1042,10 @@ Failed: {}", failures.join(", ")));
             a.set_selected_index(-1);
             refresh_folders(&a);
 
-            // Ask if user wants to also delete the backup files
-            let backup_dir = config::script_dir().join("backup").join(&name);
-            let versions_dir = config::script_dir().join("_versions").join(&name);
-            let has_backup = !name.is_empty() && (backup_dir.exists() || versions_dir.exists()) && !name.contains("..") && !name.contains("\\") && !name.contains("/");
+            // Ask if user wants to also delete the backup files (C2: keyed dirs)
+            let backup_dir = config::backup_dir_for(&source_path);
+            let versions_dir = config::trash_path_for(&source_path);
+            let has_backup = !name.is_empty() && (backup_dir.exists() || versions_dir.exists());
             if has_backup {
                 let delete_backup = rfd::MessageDialog::new()
                     .set_title("Delete Backup?")
@@ -1154,7 +1139,7 @@ Failed: {}", failures.join(", ")));
         for j in &cfg.junctions {
             let leaf = std::path::Path::new(&j.source_path)
                 .file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
-            let backup = config::backup_file_for(&leaf);
+            let backup = config::backup_file_for(&j.source_path);
             let source_exists = std::path::Path::new(&j.source_path).exists();
             if backup.exists() {
                 ok_count += 1;
@@ -1301,7 +1286,7 @@ Failed: {}", failures.join(", ")));
             let source = cfg.junctions[i].source_path.clone();
             let leaf = std::path::Path::new(&source)
                 .file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
-            let versions_folder = config::trash_path_for(&leaf);
+            let versions_folder = config::trash_path_for(&source);
 
             let mut snapshots: Vec<(String, std::path::PathBuf)> = vec![];
             if let Ok(entries) = std::fs::read_dir(&versions_folder) {

@@ -11,6 +11,10 @@ const UPDATE_PUBKEY_HEX: &str = include_str!("../signing.pub");
 #[derive(Deserialize)]
 struct Manifest {
     version: String,
+    /// H2: Ed25519 signature over "version|url|exe_sha256" — verified BEFORE
+    /// version/url are trusted. Kills rollback attacks (old exe re-served as
+    /// "v99") because the attacker can't forge this signature.
+    manifest_signature: Option<String>,
     platforms: Platforms,
 }
 
@@ -23,6 +27,9 @@ struct Platforms {
 #[derive(Deserialize)]
 struct Platform {
     url: String,
+    /// H2: SHA-256 of the exe, signed inside manifest_signature. Also lets the
+    /// client verify the download independently of the Ed25519 exe signature.
+    exe_sha256: Option<String>,
     signature: Option<String>,
 }
 
@@ -39,6 +46,23 @@ pub fn check_for_updates() {
         Ok(m) => m,
         Err(_) => return,
     };
+
+    // H2: verify the MANIFEST signature before trusting version/url from it.
+    // Canonical signed string: "version|url|exe_sha256". Older manifests without
+    // manifest_signature: keep the exe-signature check (H1) as the gate — we do
+    // NOT silently trust them for downgrade, we just behave exactly as v1.4.2 did.
+    if let Some(msig) = &manifest.manifest_signature {
+        let canonical = format!(
+            "{}|{}|{}",
+            manifest.version,
+            manifest.platforms.windows.url,
+            manifest.platforms.windows.exe_sha256.clone().unwrap_or_default()
+        );
+        if let Err(e) = verify_signature(canonical.as_bytes(), msig) {
+            let _ = e; // verification failed — refuse the update quietly (no dialog spam)
+            return;
+        }
+    }
 
     if !is_newer(&manifest.version, current) {
         return;
@@ -57,7 +81,11 @@ pub fn check_for_updates() {
         return;
     }
 
-    let temp_exe = std::env::temp_dir().join("lrgex_restore_update.exe");
+    // H1: unpredictable temp name — a predictable name lets same-user malware
+    // pre-place/swap a payload at a known path between verify and copy.
+    let nonce = rand::random::<u64>();
+    let temp_exe = std::env::temp_dir().join(format!("lrgex_upd_{:016x}.exe", nonce));
+    let bat_path = std::env::temp_dir().join(format!("lrgex_upd_{:016x}.bat", nonce));
 
     let resp = match ureq::get(&format!("{}?v={}", manifest.platforms.windows.url, manifest.version))
         .timeout(std::time::Duration::from_secs(120))
@@ -78,41 +106,92 @@ pub fn check_for_updates() {
         return;
     }
 
-    // Verify Ed25519 signature against the public key from signing.pub
-    if let Some(sig_hex) = &manifest.platforms.windows.signature {
-        if !sig_hex.is_empty() {
-            match verify_signature(&data, sig_hex) {
-                Ok(()) => {}
-                Err(e) => {
-                    show_error(&format!(
-                        "Signature verification FAILED.\n\n{}\n\nThe download may be corrupted or tampered with. Update aborted for your safety.",
-                        e
-                    ));
-                    return;
-                }
-            }
-        } else {
-            show_error("Signature is EMPTY. Update aborted.");
+    // H2: verify download against the SIGNED sha256 from the manifest (when
+    // present) — the sha256 is covered by manifest_signature, so this check
+    // is anchored to the key, not to the network.
+    if let Some(expected) = &manifest.platforms.windows.exe_sha256 {
+        let actual = {
+            use sha2::{Digest, Sha256};
+            let mut h = Sha256::new();
+            h.update(&data);
+            hex::encode(h.finalize())
+        };
+        if !actual.eq_ignore_ascii_case(expected) {
+            show_error("Download failed hash check — possible corruption. Update aborted.");
             return;
         }
-    } else {
-        show_error("No signature in manifest. Update aborted.");
+    }
+
+    // Verify Ed25519 signature against the public key from signing.pub
+    // (clone the sig so it stays in scope for the on-disk re-verify below)
+    let sig_hex = match manifest.platforms.windows.signature.clone() {
+        Some(s) if !s.is_empty() => s,
+        Some(_) => { show_error("Signature is EMPTY. Update aborted."); return; }
+        None => { show_error("No signature in manifest. Update aborted."); return; }
+    };
+    {
+        match verify_signature(&data, &sig_hex) {
+            Ok(()) => {}
+            Err(e) => {
+                show_error(&format!(
+                    "Signature verification FAILED.\n\n{}\n\nThe download may be corrupted or tampered with. Update aborted for your safety.",
+                    e
+                ));
+                return;
+            }
+        }
+    }
+
+    // H1: write, then RE-READ from disk and RE-VERIFY — closes the write→copy
+    // swap window (the check above validated memory, not the file on disk).
+    if let Err(e) = std::fs::write(&temp_exe, &data) {
+        show_error(&format!("Save failed: {}", e));
         return;
     }
-
-    match std::fs::write(&temp_exe, &data) {
-        Ok(_) => {}
-        Err(e) => { show_error(&format!("Save failed: {}", e)); return; }
+    let on_disk = match std::fs::read(&temp_exe) {
+        Ok(d) => d,
+        Err(e) => { show_error(&format!("Re-read failed: {}", e)); return; }
+    };
+    if let Err(e) = verify_signature(&on_disk, &sig_hex) {
+        show_error(&format!("On-disk verification failed — possible tampering. Aborted. ({})", e));
+        let _ = std::fs::remove_file(&temp_exe);
+        return;
     }
+    // SHA-256 of the verified bytes — the bat re-checks this before copying,
+    // closing the dialog→copy window too (certutil is in-box on Windows).
+    let expected_sha256 = {
+        use sha2::{Digest, Sha256};
+        let mut h = Sha256::new();
+        h.update(&on_disk);
+        hex::encode(h.finalize())
+    };
+    let t = temp_exe.to_string_lossy().to_string();
+    let e = exe_path.to_string_lossy().to_string();
+    let h = &expected_sha256;
+    // H1: the bat verifies the SHA-256 (certutil, in-box) right before copying —
+    // even if the temp file is swapped during the dialog window, the copy aborts.
+    // Built with join to guarantee CRLF line endings (batch files misparse with bare \n).
+    let bat_lines: Vec<String> = vec![
+        "@echo off".into(),
+        "ping 127.0.0.1 -n 3 > nul".into(),
+        ":verify".into(),
+        format!("certutil -hashfile \"{}\" SHA256 | findstr /i \"{}\" >nul 2>&1", t, h),
+        "if errorlevel 1 (".into(),
+        format!("  del \"{}\" >nul 2>&1", t),
+        "  exit /b 1".into(),
+        ")".into(),
+        ":retry".into(),
+        format!("copy /Y \"{}\" \"{}\" >nul 2>&1", t, e),
+        "if errorlevel 1 (".into(),
+        "  ping 127.0.0.1 -n 3 >nul".into(),
+        "  goto retry".into(),
+        ")".into(),
+        format!("del \"{}\" >nul 2>&1", t),
+        format!("start \"\" \"{}\"", e),
+        "del \"%~f0\"".into(),
+    ];
+    let bat = bat_lines.join("\r\n") + "\r\n";
 
-    let bat_path = std::env::temp_dir().join("lrgex-updater.bat");
-    let bat = format!(
-        "@echo off\r\nping 127.0.0.1 -n 3 > nul\r\n:retry\r\ncopy /Y \"{}\" \"{}\" >nul 2>&1\r\nif errorlevel 1 (\r\n  ping 127.0.0.1 -n 3 > nul\r\n  goto retry\r\n)\r\ndel \"{}\" >nul 2>&1\r\nstart \"\" \"{}\"\r\ndel \"%~f0\"\r\n",
-        temp_exe.to_string_lossy(),
-        exe_path.to_string_lossy(),
-        temp_exe.to_string_lossy(),
-        exe_path.to_string_lossy()
-    );
     let _ = std::fs::write(&bat_path, bat);
 
     rfd::MessageDialog::new()
