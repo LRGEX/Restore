@@ -127,7 +127,7 @@ mod tests {
     fn test_walk_tree_excludes_names() {
         let dir = make_test_folder();
         let excluded = vec!["node_modules".to_string()];
-        let (files, _, count) = walk_tree(&dir, &excluded);
+        let (_files, _, count) = walk_tree(&dir, &excluded);
         println!("\n=== WALK_TREE EXCLUDED ===");
         println!("  files after exclude: {}", count);
         assert_eq!(count, 3, "Should find 3 files (node_modules excluded)");
@@ -143,7 +143,7 @@ mod tests {
             let link = dir.join("symlink.txt");
             let _ = std::os::windows::fs::symlink_file(dir.join("file1.txt"), &link);
         }
-        let (files, _, count) = walk_tree(&dir, &[]);
+        let (_files, _, count) = walk_tree(&dir, &[]);
         println!("\n=== WALK_TREE SYMLINKS ===");
         println!("  files: {} (symlinks should be skipped)", count);
         assert_eq!(count, 4, "Symlink should be skipped, still 4 files");
@@ -341,6 +341,221 @@ mod tests {
             }
         }
         files
+    }
+
+    // ============ CONTENT-HASH MANIFEST TESTS ============
+    // Unit tests on the pure logic — no shared .lrgex state, parallel-safe.
+
+    /// Build a FileEnt for a real file on disk.
+    fn ent(path: &Path, base: &Path) -> FileEnt {
+        FileEnt {
+            path: path.to_path_buf(),
+            rel: path.strip_prefix(base).unwrap().to_path_buf(),
+            size: std::fs::metadata(path).map(|m| m.len()).unwrap_or(0),
+        }
+    }
+
+    #[test]
+    fn test_detect_change_same_size_different_content() {
+        // THE bug this whole feature fixes: same size, different content.
+        let dir = std::env::temp_dir()
+            .join(format!("lrgex_manifest_1_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("config.json");
+
+        // Backup state: "AAAAAA"
+        std::fs::write(&f, b"AAAAAA").unwrap();
+        let files = vec![ent(&f, &dir)];
+        let stored = compute_manifest(&files);
+
+        // User edits to "BBBBBB" — SAME SIZE, DIFFERENT CONTENT
+        std::fs::write(&f, b"BBBBBB").unwrap();
+        let files2 = vec![ent(&f, &dir)];
+        let (changed, _) = detect_change(&stored, &files2);
+        assert!(changed, "Same-size content edit MUST be detected");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_detect_change_identical_content() {
+        let dir = std::env::temp_dir().join(format!("lrgex_manifest_2_{}", std::process::id()))
+            .join("m2");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("save.dat");
+
+        std::fs::write(&f, b"game save v1").unwrap();
+        let files = vec![ent(&f, &dir)];
+        let stored = compute_manifest(&files);
+
+        // Nothing changed — same files re-hashed
+        let files2 = vec![ent(&f, &dir)];
+        let (changed, _) = detect_change(&stored, &files2);
+        assert!(!changed, "Identical content must NOT trigger a backup");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_detect_change_file_added() {
+        let dir = std::env::temp_dir().join(format!("lrgex_manifest_3_{}", std::process::id()))
+            .join("m3");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let f1 = dir.join("a.txt");
+        let f2 = dir.join("b.txt");
+
+        std::fs::write(&f1, b"one").unwrap();
+        let stored = compute_manifest(&[ent(&f1, &dir)]);
+
+        std::fs::write(&f2, b"two").unwrap();
+        let (changed, _) = detect_change(&stored, &[ent(&f1, &dir), ent(&f2, &dir)]);
+        assert!(changed, "Added file must be detected");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_detect_change_locked_file_size_only() {
+        // hash=0 on one side (locked at manifest build) => compare by size only.
+        // A locked file must NOT read as "changed" forever.
+        let dir = std::env::temp_dir().join(format!("lrgex_manifest_4_{}", std::process::id()))
+            .join("m4");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("locked.db");
+        std::fs::write(&f, b"0123456789").unwrap();
+
+        let mut stored = compute_manifest(&[ent(&f, &dir)]);
+        stored[0].h = 0; // simulate: was locked when the manifest was built
+
+        // Content of the file may differ now — but hash was never recorded,
+        // so size-only comparison says "unchanged".
+        let (changed, _) = detect_change(&stored, &[ent(&f, &dir)]);
+        assert!(!changed, "Locked file with same size must NOT read as changed");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_manifest_sidecar_roundtrip() {
+        let dir = std::env::temp_dir().join(format!("lrgex_manifest_5_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let sidecar = dir.join("sidecar.txt");
+
+        let manifest = vec![
+            FileMeta { p: "sub/file1.txt".into(), s: 100, h: 0xdeadbeef },
+            FileMeta { p: "locked.db".into(), s: 9999, h: 0 },
+        ];
+        write_stored_manifest(&sidecar, &manifest);
+
+        let read = read_stored_manifest(&sidecar).expect("manifest must roundtrip");
+        assert_eq!(read.len(), 2);
+        assert_eq!(read[0].p, "sub/file1.txt");
+        assert_eq!(read[0].s, 100);
+        assert_eq!(read[0].h, 0xdeadbeef);
+        assert_eq!(read[1].h, 0);
+
+        // Totals path (fast-path stats) works too
+        let raw = std::fs::read_to_string(&sidecar).unwrap();
+        let json = raw.trim().strip_prefix("manifest:").unwrap();
+        let (total, count) = parse_manifest_totals(json).unwrap();
+        assert_eq!(total, 100 + 9999);
+        assert_eq!(count, 2);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_old_sidecar_migration() {
+        // Old "size,count" format: read_stored_stats parses it, read_stored_manifest
+        // returns None => detection treats it as changed => re-backup + write manifest.
+        let dir = std::env::temp_dir().join(format!("lrgex_manifest_6_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let sidecar = dir.join("old_sidecar.txt");
+        std::fs::write(&sidecar, "12345,42").unwrap(); // old format
+
+        let (size, count) = read_stored_stats(&sidecar);
+        assert_eq!(size, 12345);
+        assert_eq!(count, 42);
+
+        assert!(read_stored_manifest(&sidecar).is_none(),
+            "Old format must NOT parse as a manifest — it must trigger migration re-backup");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_hash_file_deterministic() {
+        let dir = std::env::temp_dir().join(format!("lrgex_manifest_7_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("x.bin");
+
+        std::fs::write(&f, vec![0xABu8; 300_000]).unwrap(); // > 64KB — exercises multi-chunk loop
+        let h1 = hash_file(&f).unwrap();
+        let h2 = hash_file(&f).unwrap();
+        assert_eq!(h1, h2, "Hash must be deterministic");
+
+        std::fs::write(&f, vec![0xCDu8; 300_000]).unwrap();
+        let h3 = hash_file(&f).unwrap();
+        assert_ne!(h1, h3, "Different content must hash differently");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// E2E: backup → delete source → restore → sync again => "No changes".
+    /// This is THE test justifying content hashes over mtime: restored files have
+    /// NEW mtimes but IDENTICAL content, so an mtime-based check would false-positive.
+    /// Uses a unique leaf name to avoid colliding with other tests in shared .lrgex.
+    #[test]
+    fn test_restore_invariance_e2e() {
+        // Leaf is derived from the source folder name — pid-unique already.
+        let src = std::env::temp_dir().join(format!("lrgex_e2e_{}", std::process::id()));
+        let leaf = src.file_name().unwrap().to_string_lossy().to_string();
+        let _ = std::fs::remove_dir_all(&src);
+        std::fs::create_dir_all(src.join("nested")).unwrap();
+        std::fs::write(src.join("config.json"), b"{\"theme\":\"dark\"}").unwrap();
+        std::fs::write(src.join("nested") .join("save.dat"), b"SAVE-DATA-001").unwrap();
+
+        let src_str = src.to_string_lossy().to_string();
+
+        // 1) First backup (force first run semantics: no backup exists yet)
+        let (ok, msg) = sync_pair_to_cloud(&src_str, &[], 2, false);
+        assert!(ok, "first backup failed: {}", msg);
+        assert!(config::backup_file_for(&leaf).exists(), "backup archive must exist");
+
+        // 2) Wipe source (simulates format / restore scenario)
+        std::fs::remove_dir_all(&src).unwrap();
+
+        // 3) Restore from archive
+        let archive = config::backup_file_for(&leaf);
+        let (ok, msg) = decompress_archive(&archive, &src);
+        assert!(ok, "restore failed: {}", msg);
+
+        // 4) Sync again — restored content is IDENTICAL => must be "No changes".
+        //    mtime-based detection would fail here (restore writes new mtimes).
+        let (ok, msg) = sync_pair_to_cloud(&src_str, &[], 2, false);
+        assert!(ok, "post-restore sync failed: {}", msg);
+        assert!(msg.contains("No changes"),
+            "Restored identical content must NOT trigger a re-backup — got: {}", msg);
+
+        // 5) Same-size edit post-restore => MUST re-backup
+        std::fs::write(src.join("config.json"), b"{\"theme\":\"red_\"}").unwrap(); // same length
+        let (ok, msg) = sync_pair_to_cloud(&src_str, &[], 2, false);
+        assert!(ok, "sync after same-size edit failed: {}", msg);
+        assert!(!msg.contains("No changes"),
+            "Same-size edit after restore MUST trigger a re-backup — got: {}", msg);
+
+        // Cleanup: remove this test's artifacts from the shared .lrgex
+        let _ = std::fs::remove_file(config::backup_file_for(&leaf));
+        let _ = std::fs::remove_file(config::sidecar_for(&leaf));
+        let _ = std::fs::remove_dir_all(config::trash_path_for(&leaf));
+        let _ = std::fs::remove_dir_all(&src);
     }
 }
 
@@ -570,22 +785,123 @@ pub fn decompress_archive(archive: &Path, dest: &Path) -> (bool, String) {
 
 /// Read stored source stats from sidecar file
 fn read_stored_stats(sidecar: &Path) -> (u64, usize) {
+    // NEW manifest format: "manifest:<json>". OLD format: "size,count".
+    // For stats purposes we only need totals — hash path handled separately.
     std::fs::read_to_string(sidecar)
         .ok()
         .and_then(|s| {
-            let parts: Vec<&str> = s.trim().split(',').collect();
-            if parts.len() == 2 {
-                Some((parts[0].parse().ok()?, parts[1].parse().ok()?))
+            let s = s.trim();
+            if let Some(json) = s.strip_prefix("manifest:") {
+                // New format: parse totals from the manifest JSON
+                parse_manifest_totals(json)
             } else {
-                None
+                let parts: Vec<&str> = s.split(',').collect();
+                if parts.len() == 2 {
+                    Some((parts[0].parse().ok()?, parts[1].parse().ok()?))
+                } else {
+                    None
+                }
             }
         })
         .unwrap_or((u64::MAX, usize::MAX))
 }
 
-/// Write source stats to sidecar file
-fn write_stored_stats(sidecar: &Path, size: u64, count: usize) {
-    let _ = std::fs::write(sidecar, format!("{},{}", size, count));
+// ==================== CONTENT-HASH MANIFEST ====================
+// Per-file manifest for content-based change detection. Catches same-size
+// modifications that (size, count) stats miss (e.g. "AAAAAA" -> "BBBBBB").
+//
+// Design rules:
+// 1. FAST PATH: (size, count) mismatch => changed, skip hashing entirely.
+// 2. MIGRATION: old "size,count" sidecar (no "manifest:" prefix) => treat as
+//    changed on first manifest-capable run, write the new format.
+// 3. CONSISTENCY: manifest reflects files successfully archived. Hash-read
+//    failures on locked files fall back to size-only comparison so a
+//    permanently locked file doesn't read as "changed" forever.
+
+#[derive(serde::Serialize, serde::Deserialize, Default)]
+struct FileMeta {
+    /// Relative path, forward-slash separated (portable across the config).
+    p: String,
+    s: u64,
+    /// xxhash-style content hash — 0 means "unknown" (locked at manifest build).
+    h: u64,
+}
+
+fn manifest_key(rel: &Path) -> String {
+    rel.to_string_lossy().replace('\\', "/")
+}
+
+/// Parallel content hash of all files. Reuses the rayon walker pool.
+/// Returns None per-file on read failure (locked), keeping size for fallback.
+fn compute_manifest(files: &[FileEnt]) -> Vec<FileMeta> {
+    files
+        .par_iter()
+        .map(|f| {
+            let h = hash_file(&f.path).unwrap_or(0);
+            FileMeta { p: manifest_key(&f.rel), s: f.size, h }
+        })
+        .collect()
+}
+
+/// FNV-1a based content hash (64-bit). Non-cryptographic by design: we detect
+/// accidental change, not adversarial tampering. ~memory-bandwidth speed.
+fn hash_file(path: &Path) -> Option<u64> {
+    use std::io::Read;
+    let f = std::fs::File::open(path).ok()?;
+    let mut reader = std::io::BufReader::with_capacity(1 << 20, f);
+    let mut hash: u64 = 0xcbf29ce484222325; // FNV offset basis
+    let mut buf = [0u8; 65536];
+    loop {
+        let n = reader.read(&mut buf).ok()?;
+        if n == 0 { break; }
+        for &b in &buf[..n] {
+            hash ^= b as u64;
+            hash = hash.wrapping_mul(0x100000001b3);
+        }
+    }
+    Some(hash)
+}
+
+fn parse_manifest_totals(json: &str) -> Option<(u64, usize)> {
+    let files: Vec<FileMeta> = serde_json::from_str(json).ok()?;
+    let total: u64 = files.iter().map(|m| m.s).sum();
+    Some((total, files.len()))
+}
+
+fn read_stored_manifest(sidecar: &Path) -> Option<Vec<FileMeta>> {
+    let s = std::fs::read_to_string(sidecar).ok()?;
+    let json = s.trim().strip_prefix("manifest:")?;
+    serde_json::from_str(json).ok()
+}
+
+/// Content-based change detection. Called only when size+count already match
+/// (the "looks unchanged" path). One full parallel hash pass — the same pass
+/// whose result is REUSED as the new manifest if a backup is triggered, so the
+/// total cost is exactly one read pass per sync, never two.
+fn detect_change(stored: &[FileMeta], current_files: &[FileEnt]) -> (bool, Vec<FileMeta>) {
+    let current = compute_manifest(current_files);
+    if stored.len() != current.len() { return (true, current); }
+    let map: std::collections::HashMap<&str, &FileMeta> =
+        stored.iter().map(|m| (m.p.as_str(), m)).collect();
+    for c in &current {
+        match map.get(c.p.as_str()) {
+            None => return (true, current), // file added
+            Some(s) => {
+                if s.s != c.s { return (true, current); } // size differs
+                // hash=0 on either side = locked/unreadable — size-only compare
+                if s.h != 0 && c.h != 0 && s.h != c.h {
+                    return (true, current); // content differs (same size!)
+                }
+            }
+        }
+    }
+    (false, current)
+}
+
+fn write_stored_manifest(sidecar: &Path, manifest: &[FileMeta]) {
+    if let Ok(json) = serde_json::to_string(manifest) {
+        let _ = std::fs::write(sidecar, format!("manifest:{}", json));
+    }
 }
 
 // ==================== TIMESTAMPS ====================
@@ -659,13 +975,34 @@ pub fn sync_pair_to_cloud(source: &str, excluded: &[String], max_versions: i32, 
         let _ = std::fs::remove_dir_all(&old_backup_folder);
     }
 
-    // Change detection: compare current source stats with stored stats
+    // Change detection — two tiers:
+    // 1. FAST PATH: (size, count) from stats/manifest totals. Mismatch => changed, no hashing.
+    // 2. CONTENT: sizes match => one full parallel hash pass. Catches same-size edits.
+    //    Old-format sidecar (no "manifest:" prefix) => migration: treat as changed once.
+    //    The manifest computed here is REUSED at the write site — one hash pass total.
     let walked = walk_tree(Path::new(source), excluded);
     let current_size = walked.1;
     let current_count = walked.2;
     let (stored_size, stored_count) = read_stored_stats(&sidecar);
+    let mut manifest: Option<Vec<FileMeta>> = None;
 
-    if force || current_size != stored_size || current_count != stored_count || !backup_7z.exists() {
+    let needs_backup = if force || !backup_7z.exists() {
+        true
+    } else if current_size != stored_size || current_count != stored_count {
+        true // fast path: stats differ, no hashing needed yet
+    } else {
+        // Stats match — content check (None => old-format migration => re-backup)
+        match read_stored_manifest(&sidecar) {
+            None => true,
+            Some(stored) => {
+                let (changed, m) = detect_change(&stored, &walked.0);
+                if changed { manifest = Some(m); }
+                changed
+            }
+        }
+    };
+
+    if needs_backup {
         let mut snapshotted = false;
         // Something changed — create snapshot of old backup, then re-compress
         if backup_7z.exists() {
@@ -674,19 +1011,33 @@ pub fn sync_pair_to_cloud(source: &str, excluded: &[String], max_versions: i32, 
         }
         clean_versions(&versions_folder, max_versions as usize);
 
+        // Rule 3 (consistency): manifest reflects files that WERE archived.
+        // Computed ONCE (possibly reused from detection), before compress consumes `walked`.
+        let mut m = manifest.unwrap_or_else(|| compute_manifest(&walked.0));
+
         // Compress source to temp, then move (atomic-ish)
         // PID-unique temp name prevents corruption if two processes ever collide
         let temp_7z = std::env::temp_dir().join(format!("lrgex_{}_{}.tar.zst.tmp", std::process::id(), leaf));
         let (compress_ok, skipped) = compress_folder(Path::new(source), &temp_7z, excluded, Some(walked));
         if compress_ok {
+            // Files the archive actually skipped get hash=0 (locked at archive time).
+            // Locked files keep their size so a future size change retries the backup,
+            // but their content never reads as "changed" (rule 3).
+            let skipped_keys: std::collections::HashSet<String> =
+                skipped.iter().map(|s| s.replace('\\', "/")).collect();
+            for meta in &mut m {
+                if skipped_keys.contains(&meta.p) {
+                    meta.h = 0;
+                }
+            }
             let _ = std::fs::remove_file(&backup_7z);
             if std::fs::rename(&temp_7z, &backup_7z).is_ok() {
-                write_stored_stats(&sidecar, current_size, current_count);
+                write_stored_manifest(&sidecar, &m);
             } else {
                 // Rename failed (OneDrive lock?) — try copy + delete
                 if std::fs::copy(&temp_7z, &backup_7z).is_ok() {
                     let _ = std::fs::remove_file(&temp_7z);
-                    write_stored_stats(&sidecar, current_size, current_count);
+                    write_stored_manifest(&sidecar, &m);
                 } else {
                     let _ = std::fs::remove_file(&temp_7z);
                     return (false, "rename failed".into());
