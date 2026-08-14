@@ -1,5 +1,47 @@
 # Patch Notes — LRGEX Restore
 
+## v1.5.0 — Security & integrity hardening (3 audit cycles)
+
+### Content-hash change detection
+- Same-size file edits (e.g. `AAAAAA` → `BBBBBB`) are now detected — per-file content manifests replace the old size+count check
+- Locked files self-heal: a file that was unreadable during one backup is re-learned on the next readable sync
+- Restore-invariance: after a format + restore, sync correctly reports "No changes" (content matches, mtimes differ)
+
+### Backup integrity
+- zstd frame checksums enabled — corrupted backups fail loudly at restore, never silently restore wrong bytes
+- Archive-to-archive overwrite eliminated: two folders with the same name (two games' `Saves`) can never collide — backup identity is now a per-path key
+- Migration-safe: old backups (leaf-named or raw folders) migrate automatically on first sync or restore
+- Legacy raw-folder migration only deletes the original after the new archive is verified
+- Torn copy detection: non-atomic copy fallbacks are size + full-decode verified before being trusted
+
+### Concurrency & safety
+- Global mutation lock across all operations (scheduled sync, GUI restore, right-click add, auto-restore) — concurrent restores can never interleave and destroy data
+- Missed scheduled runs catch up on wake (StartWhenAvailable) — no more false STALE on machines that sleep
+- Short intervals can't stack: a sync that completed within the interval suppresses the next scheduled fire
+- Live config re-check each cycle: removing a folder mid-sync no longer resurrects its backup
+- Sync source that becomes unreadable aborts instead of archiving an empty set over a good backup
+
+### Update chain (self-update security)
+- Manifests are now signed (Ed25519 over version+URL+SHA-256) and verification is FAIL-CLOSED — rollback/downgrade attacks rejected
+- Downloaded exe verified against the signed hash; on-disk re-verification after write; updater script re-checks the hash before copying
+- Unpredictable temp names, bounded 64 MB download, retry caps
+
+### Path handling
+- Path healing works on any system drive (not just C:)
+- Unicode-safe token expansion (no panic on exotic characters in configs)
+- Case-insensitive home exclusion — backing up a parent of the backup store can't create archive-of-archives
+
+### UI / behavior
+- Right-click menu ON by default; setup-complete message on first run; no stray `.lrgex` folder
+- Honest dialogs everywhere: interval registration failures, config-save failures, torn archives
+- All-skipped sync cycles keep the previous status (no more false "0 folders protected")
+- Interval input validated 1–44640 minutes
+- Orphaned temp/staging files swept from %TEMP% and junction parents (headless machines included)
+- Health checks run off the UI thread — no more 30-second stalls
+
+### Defaults
+- Sync interval: 1440 minutes (24 h) · Max versions: 2 · Auto-restore: off
+
 ## v1.4.2 — STALE root cause fix
 
 ### Scheduled task now catches up on missed runs
