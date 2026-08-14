@@ -36,6 +36,14 @@ fn main() {
         // covered, not just this one.
         config::migrate_to_data_dir();
         config::ensure_versions_setup();
+        // INTERVAL-GUARD: a scheduled fire while the previous cycle completed
+        // less than one interval ago is a no-op (1-min interval + 4-min backup
+        // no longer stacks waiting task instances). The pair lock still guards
+        // truly concurrent runs; this guards rapid-fire re-fires.
+        let cfg_guard = config::load_config();
+        if config::sync_completed_recently(cfg_guard.sync_interval_minutes as i64) {
+            return;
+        }
         sync::sweep_orphaned_temps(); // L7: headless machines never launch the GUI
         sync::sweep_orphaned_restore_dirs(&config::load_config()); // M-5
         sync::sync_all_pairs();

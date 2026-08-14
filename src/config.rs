@@ -55,6 +55,39 @@ pub fn data_dir() -> PathBuf {
 }
 
 /// One-time migration: move scattered root files into .lrgex/ subfolder.
+/// INTERVAL-GUARD marker: written ONLY at successful completion of a full sync
+/// cycle. A scheduled -sync that finds a completed sync younger than the
+/// configured interval exits early — protects a 1-minute interval from firing
+/// while/after a 4-minute mega-folder backup (the lock already serializes
+/// concurrent runs; this stops the pile-up of waiting task instances).
+/// Deliberately NOT sync-status.json — that file is rewritten constantly by
+/// progress writes and manual/GUI operations; a marker from it would suppress
+/// scheduled syncs after every manual backup.
+pub fn last_sync_marker_path() -> PathBuf {
+    data_dir().join("last-sync-complete")
+}
+
+pub fn write_last_sync_marker() {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let secs = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    let _ = std::fs::write(last_sync_marker_path(), secs.to_string());
+}
+
+/// True if a completed sync is younger than `interval_minutes` (grace 1 min).
+pub fn sync_completed_recently(interval_minutes: i64) -> bool {
+    let age = std::fs::read_to_string(last_sync_marker_path())
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .map(|then| {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|now| now.as_secs().saturating_sub(then))
+                .unwrap_or(u64::MAX)
+        })
+        .unwrap_or(u64::MAX);
+    age < interval_minutes.max(1) as u64 * 60 + 60
+}
+
 pub fn migrate_to_data_dir() {
     let dd = data_dir();
     let sd = script_dir();

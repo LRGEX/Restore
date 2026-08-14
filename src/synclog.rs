@@ -21,11 +21,18 @@ pub fn write(msg: &str) {
     if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(&path) {
         let _ = f.write_all(line.as_bytes());
     }
+    // L-6: mtime-guarded trim — two processes passing 2050 lines near-simultaneously
+    // would last-writer-wins and lose ~50 lines. Capture mtime before the read;
+    // write the trim only if nothing appended in between (next append retries).
+    let mtime_before = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
     if let Ok(data) = std::fs::read_to_string(&path) {
         let lines: Vec<&str> = data.lines().collect();
         if lines.len() > 2050 {
-            let trimmed = lines[lines.len()-2000..].join("\r\n");
-            let _ = std::fs::write(&path, trimmed);
+            let mtime_now = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
+            if mtime_before.is_some() && mtime_before == mtime_now {
+                let trimmed = lines[lines.len()-2000..].join("\r\n");
+                let _ = std::fs::write(&path, trimmed);
+            }
         }
     }
 }

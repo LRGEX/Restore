@@ -780,7 +780,6 @@ pub fn compress_folder(
     let t_all = std::time::Instant::now();
     let label = source.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
     let progress = crate::synclog::Progress::new(&label);
-    let heartbeat = progress.spawn_writer();
     progress.set_phase(0); // walk
 
     let t_walk = std::time::Instant::now();
@@ -788,7 +787,7 @@ pub fn compress_folder(
         Some(w) => w,
         None => match walk_tree(source, excluded) {
             Some(w) => w,
-            None => return (false, vec![]),
+            None => { progress.finish(4); return (false, vec![]); } // M-1: stop set, no writer leaked
         },
     };
     let walk = t_walk.elapsed();
@@ -797,18 +796,23 @@ pub fn compress_folder(
 
     let file = match std::fs::File::create(dest) {
         Ok(f) => f,
-        Err(_) => return (false, vec![]),
+        Err(_) => { progress.finish(4); return (false, vec![]); } // M-1
     };
     let writer = BufWriter::with_capacity(4 * 1024 * 1024, file);
 
     let mut encoder = match zstd::Encoder::new(writer, 1) {
         Ok(e) => e,
-        Err(_) => return (false, vec![]),
+        Err(_) => { progress.finish(4); return (false, vec![]); } // M-1
     };
     let threads = std::thread::available_parallelism().map(|n| n.get() as u32).unwrap_or(4);
     let _ = encoder.multithread(threads);
     let _ = encoder.include_checksum(true); // H3: frame checksum — bit rot fails LOUD, not silently
     let mut builder = tar::Builder::new(encoder.auto_finish());
+
+    // M-1: heartbeat spawns ONLY after every early-fail check passed — it can
+    // never outlive the function on those paths. Earlier exits called finish(4)
+    // which sets stop, so even a pre-existing zombie is retired.
+    let heartbeat = progress.spawn_writer();
 
     let t_append = std::time::Instant::now();
     let mut processed = 0usize;
@@ -1211,9 +1215,11 @@ pub fn sync_pair_to_cloud(source: &str, excluded: &[String], max_versions: i32, 
     config::migrate_pair_key(source);
 
     // Migration: old root-level backup → delete (will re-compress to backup/ on next sync)
+    // L-4: only when the app's OWN sidecar marker also exists — a lone
+    // <leaf>.tar.zst could be a user file that happens to share the name.
     let old_root_backup = config::script_dir().join(format!("{}.tar.zst", leaf));
     let old_root_sidecar = config::script_dir().join(format!("{}.tar.zst.size", leaf));
-    if old_root_backup.exists() {
+    if old_root_backup.exists() && old_root_sidecar.exists() {
         let _ = std::fs::remove_file(&old_root_backup);
         let _ = std::fs::remove_file(&old_root_sidecar);
     }
@@ -1251,11 +1257,19 @@ pub fn sync_pair_to_cloud(source: &str, excluded: &[String], max_versions: i32, 
     };
     // M-6: NEVER archive the app's own home (archive-of-archives = unbounded
     // growth + OneDrive re-upload storms). Filter walked entries under script_dir.
+    // M-2: CASE-INSENSITIVE compare — Path::starts_with does no folding, so
+    // "d:\cloud" vs home "D:\Cloud" silently re-enabled archive-of-archives.
     let home = config::script_dir();
-    let (files, mut current_size, mut current_count) = walked;
+    let home_lc = home.to_string_lossy().to_lowercase();
+    let home_prefix = format!("{}{}", home_lc.trim_end_matches('\\'), "\\");
+    let (files, walked_raw_count, mut current_size, mut current_count) = {
+        let (f, s, c) = walked;
+        (f, c, s, c)
+    };
     let filtered: Vec<crate::sync::FileEnt> = files.into_iter()
         .filter(|e| {
-            let under_home = e.path.starts_with(&home);
+            let p_lc = e.path.to_string_lossy().to_lowercase();
+            let under_home = p_lc.starts_with(&home_prefix);
             if under_home {
                 crate::synclog::write(&format!("  [EXCLUDE] home folder member skipped: {}", e.path.display()));
             }
@@ -1267,15 +1281,33 @@ pub fn sync_pair_to_cloud(source: &str, excluded: &[String], max_versions: i32, 
         current_count = filtered.len();
     }
     let walked = (filtered, current_size, current_count);
-    // H-2 belt-and-braces: a genuine source with ZERO files when a non-empty
-    // backup exists => suspicious (root race, mass deletion) — refuse to
-    // destroy the chain silently. Log loudly; user can force via Remove+re-add.
+    // H-2/M-3: a source reading ZERO files while a non-empty backup exists is
+    // suspicious — refuse to destroy the chain silently. Three honest cases:
+    //   (a) entire content was home members (M-6 filtered) — remove this pair.
+    //   (b) force (re-add) — user's explicit act, bypass with a log line.
+    //   (c) genuinely emptied/unreadable — refuse with an actionable message.
+    // The OLD guard ran before the force check, turning "remove + re-add" into
+    // a trap (M-3); force is now honored.
     if walked.2 == 0 && backup_7z.exists() {
         let (_, stored_count) = read_stored_stats(&sidecar);
         if stored_count > 0 {
-            crate::synclog::write(&format!(
-                "  [GUARD] {} reads as EMPTY but backup holds {} files — refusing to archive an empty set", leaf, stored_count));
-            return (false, "source suddenly empty — backup NOT overwritten (possible read failure)".into());
+            if walked_raw_count > 0 {
+                // (a) home members were the ONLY content — archiving is impossible
+                crate::synclog::write(&format!(
+                    "  [GUARD] {} contains only LRGEX home members — this pair cannot be backed up", leaf));
+                return (false, "this folder is inside the LRGEX home — remove it from the list (backing up the backup store is not supported)".into());
+            }
+            if force {
+                // (b) explicit user action (re-add) — allow the empty backup
+                crate::synclog::write(&format!(
+                    "  [GUARD-BYPASS] {} archived EMPTY by explicit re-add (force)", leaf));
+            } else {
+                // (c) refuse — with an actionable message (M-3: the old escape
+                // hint was a trap because force ran after this guard)
+                crate::synclog::write(&format!(
+                    "  [GUARD] {} reads as EMPTY but backup holds {} files — refusing to archive an empty set", leaf, stored_count));
+                return (false, format!("folder is empty but the backup holds {} files — if you emptied it on purpose, remove the folder from the list and add it back", stored_count));
+            }
         }
     }
     let current_size = walked.1;
@@ -1400,21 +1432,37 @@ pub fn pre_check_restore(paths: &[String]) -> Vec<(String, String)> {
         // to a redundant re-backup at best, a lost race at worst.
         let backup = config::backup_file_for(path);
 
-        // 1. Backup archive exists?
-        if !backup.exists() {
+        // H-1: restorable-predicate PARITY with restore_pair_from_cloud — the
+        // old check accepted only the keyed archive, so an unmigrated pre-C2
+        // store (leaf-only, or v1.3 raw folder) aborted the GUI Restore flow
+        // with a false "backup missing" BEFORE the code that would migrate it
+        // could ever run. Read-only existence checks; migration still happens
+        // under the lock in restore.
+        let restorable = backup.exists()
+            // pre-C2 leaf-only dir with archive inside (migration will handle it)
+            || config::script_dir().join("backup").join(&leaf).join(format!("{}.tar.zst", leaf)).exists()
+            // v1.3-era raw folder (restore_pair's own robocopy fallback)
+            || config::legacy_raw_folder(path).is_some();
+
+        // 1. Backup archive exists (in any supported form)?
+        if !restorable {
             failures.push((leaf, "backup missing".into()));
             continue;
         }
 
         // 2. Archive is valid zstd? (check magic bytes: 28 b5 2f fd)
-        let mut header = [0u8; 4];
-        let valid_zstd = std::fs::File::open(&backup)
-            .and_then(|mut f| f.read_exact(&mut header).map(|_| f))
-            .map(|_| header == [0x28, 0xb5, 0x2f, 0xfd])
-            .unwrap_or(false);
-        if !valid_zstd {
-            failures.push((leaf, "backup archive is corrupt or incomplete".into()));
-            continue;
+        //    Only when the KEYED archive exists — a legacy fallback (raw folder)
+        //    is restored by robocopy, not by zstd decode, so magic check N/A.
+        if backup.exists() {
+            let mut header = [0u8; 4];
+            let valid_zstd = std::fs::File::open(&backup)
+                .and_then(|mut f| f.read_exact(&mut header).map(|_| f))
+                .map(|_| header == [0x28, 0xb5, 0x2f, 0xfd])
+                .unwrap_or(false);
+            if !valid_zstd {
+                failures.push((leaf, "backup archive is corrupt or incomplete".into()));
+                continue;
+            }
         }
         // 3. Destination is writable? (report ACTUAL error, not generic)
         let dest = std::path::Path::new(path);
@@ -1495,6 +1543,7 @@ pub fn sync_all_pairs() {
     let mut ok = 0i32;
     let mut fail = 0i32;
     let mut restored = 0i32;
+    let mut lock_skipped = 0i32;
     let mut restored_names: Vec<String> = vec![];
 
     crate::synclog::write("------------------------------------------------------------");
@@ -1504,6 +1553,14 @@ pub fn sync_all_pairs() {
     for j in &cfg.junctions {
         let leaf = Path::new(&j.source_path).file_name()
             .map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+        // M-5: re-validate against the LIVE config each iteration — a GUI
+        // Remove mid-cycle must not let this stale snapshot resurrect the
+        // deleted pair's backup (multi-GB orphan the user was told was gone).
+        let live = config::load_config();
+        if !live.junctions.iter().any(|lj| config::same_path(&lj.source_path, &j.source_path)) {
+            crate::synclog::write(&format!("  [SKIP] {}  -  removed from config mid-cycle", leaf));
+            continue;
+        }
         let missing = !Path::new(&j.source_path).exists() || is_dir_empty(&j.source_path);
 
         if missing && j.auto_restore {
@@ -1519,6 +1576,7 @@ pub fn sync_all_pairs() {
                 for m in &mig { crate::synclog::write(&format!("  [MIGRATE] {}", m)); }
             } else if reason.contains("another LRGEX operation") {
                 // M-4: lock held by a concurrent GUI operation — skip, not fail
+                lock_skipped += 1;
                 crate::synclog::write(&format!("  [SKIP] {}  -  concurrent operation holds the lock", leaf));
             } else {
                 fail += 1;
@@ -1541,6 +1599,7 @@ pub fn sync_all_pairs() {
                 // global lock made every overlapping scheduled cycle report a
                 // false RED. Skip, don't fail.
                 if reason.contains("another LRGEX operation") {
+                    lock_skipped += 1;
                     crate::synclog::write(&format!("  [SKIP] {}  -  concurrent operation holds the lock", leaf));
                 } else {
                     fail += 1;
@@ -1550,8 +1609,20 @@ pub fn sync_all_pairs() {
         }
     }
 
+    // M-4: an all-skipped cycle (lock held by a long GUI restore) carries ZERO
+    // information — writing "0 folders protected" would overwrite a good status
+    // for up to a full interval. Keep the previous status instead.
+    if ok + restored + fail == 0 && lock_skipped > 0 {
+        crate::synclog::write(&format!("Done: all {} skipped (lock held) — previous status kept.", lock_skipped));
+        return;
+    }
     crate::synclog::write(&format!("Done: {} compressed, {} restored, {} failed.", ok, restored, fail));
     crate::health::write_status(ok + restored, fail, restored, &restored_names);
+    // INTERVAL-GUARD: only a REAL cycle (something attempted) stamps the marker —
+    // an all-skip cycle (lock held) must not defer the next scheduled run.
+    if ok + restored + fail > 0 {
+        config::write_last_sync_marker();
+    }
 }
 
 // ==================== RESTORE FROM SNAPSHOT ====================

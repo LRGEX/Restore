@@ -1528,30 +1528,34 @@ Failed: {}", failures.join(", ")));
             match mode {
                 0 => { // Sync Interval
                     if let Ok(mins) = val.trim().parse::<i32>() {
-                        if mins >= 1 {
+                        // L-7: Task Scheduler's repetition cap is 31 days (44640 min)
+                        // — schtasks rejects anything above, so validate up front.
+                        if mins >= 1 && mins <= 44640 {
                             let mut c2 = config::load_config();
                             c2.sync_interval_minutes = mins;
                             config::save_config(&c2);
-                            // H-1: verify registration actually succeeded before
-                            // claiming it — a failed schtasks silently kept the
-                            // OLD interval while telling the user "Set to X".
-                            let (tx, rx) = std::sync::mpsc::channel();
-                            std::thread::spawn(move || { tx.send(sync::register_sync_task(mins)).ok(); });
-                            let registered = rx.recv_timeout(std::time::Duration::from_secs(20)).unwrap_or(false);
-                            let saved = config::load_config().sync_interval_minutes == mins;
-                            rfd::MessageDialog::new()
-                                .set_title("Sync Interval")
-                                .set_description(if registered && saved {
-                                    format!("Set to {} minute(s).", mins)
-                                } else if !saved {
-                                    "Config could not be saved (disk full or OneDrive lock?) — interval NOT changed.".into()
-                                } else {
-                                    "Failed to register the scheduled task — interval NOT applied.".into()
-                                })
-                                .set_buttons(rfd::MessageButtons::Ok)
-                                .show();
+                            // H-1/M-6: ONE worker thread — register, verify,
+                            // dialog. No channel, no UI-thread blocking (20s
+                            // freeze when Task Scheduler was slow), and the
+                            // config re-read happens in the SAME thread AFTER
+                            // save_config has returned — no race on `saved`.
+                            std::thread::spawn(move || {
+                                let registered = sync::register_sync_task(mins);
+                                let saved = config::load_config().sync_interval_minutes == mins;
+                                rfd::MessageDialog::new()
+                                    .set_title("Sync Interval")
+                                    .set_description(if registered && saved {
+                                        format!("Set to {} minute(s).", mins)
+                                    } else if !saved {
+                                        "Config could not be saved (disk full or OneDrive lock?) — interval NOT changed.".into()
+                                    } else {
+                                        "Failed to register the scheduled task — interval NOT applied.".into()
+                                    })
+                                    .set_buttons(rfd::MessageButtons::Ok)
+                                    .show();
+                            });
                         } else {
-                            rfd::MessageDialog::new().set_title("Invalid").set_description("Enter 1 or more.").set_buttons(rfd::MessageButtons::Ok).show();
+                            rfd::MessageDialog::new().set_title("Invalid").set_description("Enter 1 to 44640 minutes (31 days max).").set_buttons(rfd::MessageButtons::Ok).show();
                         }
                     } else {
                         rfd::MessageDialog::new().set_title("Invalid").set_description("Enter a whole number.").set_buttons(rfd::MessageButtons::Ok).show();
