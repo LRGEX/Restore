@@ -170,11 +170,12 @@ pub fn check_for_updates() {
     // swap window (the check above validated memory, not the file on disk).
     if let Err(e) = std::fs::write(&temp_exe, &data) {
         show_error(&format!("Save failed: {}", e));
+        let _ = std::fs::remove_file(&temp_exe); // I-4: uniform cleanup
         return;
     }
     let on_disk = match std::fs::read(&temp_exe) {
         Ok(d) => d,
-        Err(e) => { show_error(&format!("Re-read failed: {}", e)); return; }
+        Err(e) => { show_error(&format!("Re-read failed: {}", e)); let _ = std::fs::remove_file(&temp_exe); return; }
     };
     if let Err(e) = verify_signature(&on_disk, &sig_hex) {
         show_error(&format!("On-disk verification failed — possible tampering. Aborted. ({})", e));

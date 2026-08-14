@@ -70,6 +70,24 @@ pub fn sweep_orphaned_restore_dirs(cfg: &crate::config::Config) {
             }
         }
     }
+
+    // L-5: ALSO scan %TEMP% — killed decompress_archive staging
+    // (.lrgex_restore_<pid>_<seq>) lives there when the archive destination
+    // is %TEMP% itself (preview flow), not under a junction parent.
+    if let Ok(temp_entries) = std::fs::read_dir(std::env::temp_dir()) {
+        for entry in temp_entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if let Some(pid_part) = name.strip_prefix(".lrgex_restore_") {
+                if let Some(pid_str) = pid_part.split('_').next() {
+                    if let Ok(pid) = pid_str.parse::<u32>() {
+                        if pid != std::process::id() && !crate::synclog::is_pid_alive(pid) {
+                            let _ = std::fs::remove_dir_all(entry.path());
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 // ==================== C3: GLOBAL MUTATION LOCK ====================
@@ -973,15 +991,31 @@ pub fn decompress_archive(archive: &Path, dest: &Path) -> (bool, String) {
             crate::synclog::write(&format!("  [DECOMPRESS] unpack OK - {} entries, {} bytes archive", ec, arch_size));
             // M4: PID-suffixed bak name is collision-proof; a crash-recovery bak
             // (stale *.lrgex_bak.* + dest missing) is RECOVERED, never deleted.
+            // L-2: when dest EXISTS, any other-pid bak is provably stale (the
+            // pair lock makes a concurrent same-name restore impossible) —
+            // sweep it instead of leaking a full-size copy per crash.
             if let Some(parent) = dest.parent() {
                 let name = dest.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+                let bak_prefix = format!("{}.lrgex_bak.", name);
                 if !dest.exists() {
                     if let Ok(entries) = std::fs::read_dir(parent) {
                         for entry in entries.flatten() {
                             let en = entry.file_name().to_string_lossy().to_string();
-                            if en.starts_with(&format!("{}.lrgex_bak.", name)) {
+                            if en.starts_with(&bak_prefix) {
                                 let _ = std::fs::rename(entry.path(), dest);
                                 break;
+                            }
+                        }
+                    }
+                } else {
+                    // dest present + stale baks => crash happened between rename
+                    // and bak-delete. Under the lock, no live sibling can own one.
+                    if let Ok(entries) = std::fs::read_dir(parent) {
+                        for entry in entries.flatten() {
+                            let en = entry.file_name().to_string_lossy().to_string();
+                            if en.starts_with(&bak_prefix)
+                                && !en.ends_with(&format!(".{}", std::process::id()).to_string()) {
+                                let _ = std::fs::remove_dir_all(entry.path());
                             }
                         }
                     }
@@ -1174,11 +1208,22 @@ fn create_snapshot(backup_7z: &Path, versions_folder: &Path) {
 
 /// Delete old versioning snapshots
 /// Keep only the N newest snapshots, delete the rest
+/// L-3: ONE snapshot-name validator, used by clean_versions AND the GUI
+/// versions list — 15 ASCII digits + underscore (YYYYMMDD_HHMMSS). Byte-based:
+/// a multibyte 15-CHAR name must never slice-panic or delete-sort into the set.
+pub fn is_snapshot_name(name: &str) -> bool {
+    let b = name.as_bytes();
+    b.len() == 15
+        && b[..8].iter().all(|c| c.is_ascii_digit())
+        && b[8] == b'_'
+        && b[9..].iter().all(|c| c.is_ascii_digit())
+}
+
 fn clean_versions(versions_folder: &Path, max_versions: usize) {
     if let Ok(entries) = std::fs::read_dir(versions_folder) {
         let mut snapshots: Vec<_> = entries
             .flatten()
-            .filter(|e| e.file_name().to_string_lossy().len() == 15)
+            .filter(|e| is_snapshot_name(&e.file_name().to_string_lossy()))
             .collect();
         snapshots.sort_by(|a, b| b.file_name().cmp(&a.file_name()));
         for entry in snapshots.iter().skip(max_versions) {
@@ -1374,21 +1419,42 @@ pub fn sync_pair_to_cloud(source: &str, excluded: &[String], max_versions: i32, 
                     // would read "No changes" forever on a dead archive.
                     let temp_len = std::fs::metadata(&temp_7z).map(|m| m.len()).unwrap_or(u64::MAX);
                     let dest_len = std::fs::metadata(&backup_7z).map(|m| m.len()).unwrap_or(0);
+                    // INFO hardening: FULL decode probe (not header-only) — same-length
+                    // mid-stream corruption is caught before we trust the copy.
                     let decode_ok = std::fs::File::open(&backup_7z)
                         .ok()
                         .and_then(|f| zstd::stream::read::Decoder::new(f).ok())
-                        .is_some();
+                        .map(|mut dec| std::io::copy(&mut dec, &mut std::io::sink()).is_ok())
+                        .unwrap_or(false);
                     if temp_len == dest_len && decode_ok {
                         let _ = std::fs::remove_file(&temp_7z);
                         clean_versions(&versions_folder, max_versions as usize); // L1: after success
                         write_stored_manifest(&sidecar, &m);
                     } else {
                         let _ = std::fs::remove_file(&temp_7z);
-                        // The torn copy ALREADY replaced backup_7z — the good copy
-                        // survives only in the pre-change snapshot. Say so, loudly.
-                        crate::synclog::write(&format!(
-                            "  [VERIFY-FAIL] copy of {} was torn — live archive DAMAGED; good copy is in _versions", leaf));
-                        return (false, "archive damaged during copy — restore from Versions".into());
+                        // The torn copy ALREADY replaced backup_7z — verify whether the
+                        // pre-change snapshot actually survived before claiming it.
+                        let snapshot_ok = {
+                            let mut found = false;
+                            if let Ok(entries) = std::fs::read_dir(&versions_folder) {
+                                for e in entries.flatten() {
+                                    if is_snapshot_name(&e.file_name().to_string_lossy()) {
+                                        found = true;
+                                        break;
+                                    }
+                                }
+                            }
+                            found
+                        };
+                        if snapshot_ok {
+                            crate::synclog::write(&format!(
+                                "  [VERIFY-FAIL] copy of {} was torn — live archive DAMAGED; good copy confirmed in _versions", leaf));
+                            return (false, "archive damaged during copy — restore from Versions".into());
+                        } else {
+                            crate::synclog::write(&format!(
+                                "  [VERIFY-FAIL] copy of {} was torn AND no snapshot exists — data at risk, source files are intact", leaf));
+                            return (false, "archive damaged during copy and no version snapshot exists — the SOURCE files are still intact; re-add the folder to rebuild".into());
+                        }
                     }
                 } else {
                     let _ = std::fs::remove_file(&temp_7z);

@@ -1084,30 +1084,36 @@ Failed: {}", failures.join(", ")));
                     .set_buttons(rfd::MessageButtons::YesNo)
                     .show() == rfd::MessageDialogResult::Yes;
                 if delete_backup {
-                    // M-3: deletion under the global lock — a scheduled sync could
-                    // otherwise race a snapshot hardlink into a dir being deleted.
-                    let mut deleted = false;
-                    match sync::acquire_pair_lock(10_000) {
-                        Some(_lock) => {
-                            let _ = std::fs::remove_dir_all(&backup_dir);
-                            let _ = std::fs::remove_dir_all(&versions_dir);
-                            deleted = true;
+                    // M-3 + L-1: deletion under the global lock, OFF the UI thread —
+                    // the 10s lock wait froze the window; dialogs from the worker
+                    // (rfd is thread-safe on Windows).
+                    let backup_dir = backup_dir.clone();
+                    let versions_dir = versions_dir.clone();
+                    let name = name.clone();
+                    std::thread::spawn(move || {
+                        let mut deleted = false;
+                        match sync::acquire_pair_lock(10_000) {
+                            Some(_lock) => {
+                                let _ = std::fs::remove_dir_all(&backup_dir);
+                                let _ = std::fs::remove_dir_all(&versions_dir);
+                                deleted = true;
+                            }
+                            None => {
+                                rfd::MessageDialog::new()
+                                    .set_title("Busy")
+                                    .set_description("A sync is running — the backup files could not be deleted now. Remove it again when the sync finishes.")
+                                    .set_buttons(rfd::MessageButtons::Ok)
+                                    .show();
+                            }
                         }
-                        None => {
+                        if deleted {
                             rfd::MessageDialog::new()
-                                .set_title("Busy")
-                                .set_description("A sync is running — the backup files could not be deleted now. Remove it again when the sync finishes.")
+                                .set_title("Done")
+                                .set_description(&format!("'{}' and its backup fully removed.", name))
                                 .set_buttons(rfd::MessageButtons::Ok)
                                 .show();
                         }
-                    }
-                    if deleted {
-                        rfd::MessageDialog::new()
-                            .set_title("Done")
-                            .set_description(&format!("'{}' and its backup fully removed.", name))
-                            .set_buttons(rfd::MessageButtons::Ok)
-                            .show();
-                    }
+                    });
                 } else {
                     rfd::MessageDialog::new()
                         .set_title("Removed")
@@ -1344,13 +1350,8 @@ Failed: {}", failures.join(", ")));
             if let Ok(entries) = std::fs::read_dir(&versions_folder) {
                 for entry in entries.flatten() {
                     let name = entry.file_name().to_string_lossy().to_string();
-                    // L-2: validate AS BYTES before slicing — a multibyte-UTF-8
-                    // 15-char name would panic the GUI event loop mid-slice.
-                    let b = name.as_bytes();
-                    if b.len() == 15 && entry.path().is_dir()
-                        && b[..8].iter().all(|c| c.is_ascii_digit())
-                        && b[8] == b'_'
-                        && b[9..].iter().all(|c| c.is_ascii_digit()) {
+                    // L-3: shared validator (same rule as clean_versions).
+                    if sync::is_snapshot_name(&name) && entry.path().is_dir() {
                         let formatted = format!(
                             "{}-{}-{} {}:{}:{}",
                             &name[0..4], &name[4..6], &name[6..8],
