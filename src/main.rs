@@ -37,6 +37,7 @@ fn main() {
         config::migrate_to_data_dir();
         config::ensure_versions_setup();
         sync::sweep_orphaned_temps(); // L7: headless machines never launch the GUI
+        sync::sweep_orphaned_restore_dirs(&config::load_config()); // M-5
         sync::sync_all_pairs();
         return;
     }

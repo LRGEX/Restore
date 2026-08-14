@@ -47,19 +47,27 @@ pub fn check_for_updates() {
         Err(_) => return,
     };
 
-    // H2: verify the MANIFEST signature before trusting version/url from it.
-    // Canonical signed string: "version|url|exe_sha256". Older manifests without
-    // manifest_signature: keep the exe-signature check (H1) as the gate — we do
-    // NOT silently trust them for downgrade, we just behave exactly as v1.4.2 did.
-    if let Some(msig) = &manifest.manifest_signature {
-        let canonical = format!(
-            "{}|{}|{}",
-            manifest.version,
-            manifest.platforms.windows.url,
-            manifest.platforms.windows.exe_sha256.clone().unwrap_or_default()
-        );
-        if let Err(e) = verify_signature(canonical.as_bytes(), msig) {
-            let _ = e; // verification failed — refuse the update quietly (no dialog spam)
+    // Version-equality fast path (advisor): an up-to-date client deciding "no
+    // update" doesn't need to trust the manifest's version claim.
+    if manifest.version == current { return; }
+
+    // H-3: FAIL-CLOSED manifest trust (gate BEFORE is_newer). This client ships
+    // AFTER the signed-manifest deploy exists (deploy.ps1 signs since 7c4be77) —
+    // every genuine manifest it can fetch carries manifest_signature + exe_sha256.
+    // Unsigned = forged (attacker re-serving a genuine old exe as "v9.9.9" with
+    // its public signature). Old clients never read these fields, so fail-open
+    // protected an empty set and armed the downgrade. Refuse quietly + log.
+    let (msig, exe_sha) = match (&manifest.manifest_signature, &manifest.platforms.windows.exe_sha256) {
+        (Some(m), Some(s)) if !m.is_empty() && !s.is_empty() => (m.clone(), s.clone()),
+        _ => {
+            crate::synclog::write("[UPDATE] rejected unsigned manifest (no manifest_signature)");
+            return;
+        }
+    };
+    {
+        let canonical = format!("{}|{}|{}", manifest.version, manifest.platforms.windows.url, exe_sha);
+        if verify_signature(canonical.as_bytes(), &msig).is_err() {
+            crate::synclog::write("[UPDATE] rejected manifest: signature verification failed");
             return;
         }
     }
@@ -96,9 +104,22 @@ pub fn check_for_updates() {
 
     let mut reader = resp.into_reader();
     let mut data = Vec::new();
-    match reader.read_to_end(&mut data) {
-        Ok(_) => {}
-        Err(e) => { show_error(&format!("Read failed: {}", e)); return; }
+    // L-5: bounded read — a compromised/buggy CDN serving a multi-GB body must
+    // not OOM the app. Cap at 64 MB (the exe is ~17 MB; huge margin).
+    let mut remaining = 64 * 1024 * 1024usize;
+    let mut chunk = [0u8; 65536];
+    loop {
+        let n = match reader.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(e) => { show_error(&format!("Read failed: {}", e)); return; }
+        };
+        if n > remaining {
+            show_error("Downloaded file exceeds 64 MB — refusing. Possible CDN problem.");
+            return;
+        }
+        data.extend_from_slice(&chunk[..n]);
+        remaining -= n;
     }
 
     if data.len() < 1_000_000 {
@@ -109,7 +130,10 @@ pub fn check_for_updates() {
     // H2: verify download against the SIGNED sha256 from the manifest (when
     // present) — the sha256 is covered by manifest_signature, so this check
     // is anchored to the key, not to the network.
-    if let Some(expected) = &manifest.platforms.windows.exe_sha256 {
+    // H2/H-3: exe_sha256 is guaranteed present (fail-closed gate above) — the
+    // download MUST match the SIGNED hash from the manifest.
+    {
+        let expected = &exe_sha;
         let actual = {
             use sha2::{Digest, Sha256};
             let mut h = Sha256::new();
@@ -181,18 +205,28 @@ pub fn check_for_updates() {
         "  exit /b 1".into(),
         ")".into(),
         ":retry".into(),
+        "set /a tries=0".into(),
+        ":retryloop".into(),
         format!("copy /Y \"{}\" \"{}\" >nul 2>&1", t, e),
-        "if errorlevel 1 (".into(),
-        "  ping 127.0.0.1 -n 3 >nul".into(),
-        "  goto retry".into(),
-        ")".into(),
+        "if not errorlevel 1 goto done".into(),
+        "set /a tries+=1".into(),
+        "if %tries% geq 30 (\r\n  del \"%~f0\" >nul 2>&1\r\n  exit /b 1\r\n)".into(), // L-6a: cap ~90s, no zombie cmd
+        "ping 127.0.0.1 -n 3 >nul".into(),
+        "goto retryloop".into(),
+        ":done".into(),
         format!("del \"{}\" >nul 2>&1", t),
         format!("start \"\" \"{}\"", e),
         "del \"%~f0\"".into(),
     ];
     let bat = bat_lines.join("\r\n") + "\r\n";
 
-    let _ = std::fs::write(&bat_path, bat);
+    // L-6b: bat write failure must abort — spawning cmd on a nonexistent file
+    // silently produced a zombie no-update.
+    if std::fs::write(&bat_path, bat).is_err() {
+        show_error("Could not write updater script. Update aborted.");
+        let _ = std::fs::remove_file(&temp_exe);
+        return;
+    }
 
     rfd::MessageDialog::new()
         .set_title("Updating")

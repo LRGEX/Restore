@@ -649,6 +649,7 @@ pub fn run() {
     // Startup sweep: clean up orphaned temp files from killed compressions.
     config::migrate_to_data_dir();
     sync::sweep_orphaned_temps();
+    sync::sweep_orphaned_restore_dirs(&config::load_config()); // M-5: killed-restore staging dirs
 
     // First-run: relocate to home folder if needed
     if !config::is_home() {
@@ -1037,8 +1038,24 @@ Failed: {}", failures.join(", ")));
                 .set_buttons(rfd::MessageButtons::YesNo)
                 .show() == rfd::MessageDialogResult::Yes;
             if !confirm { return; }
-            cfg.junctions.remove(i);
-            config::save_config(&cfg);
+            // L-9: re-resolve by PATH before mutating — the index may point at a
+            // different junction if the config changed since selection (removes
+            // the wrong pair's entry).
+            let mut cfg = config::load_config(); // fresh load: dialogs took time
+            match cfg.junctions.iter().position(|j| config::same_path(&j.source_path, &source_path)) {
+                Some(pos) => {
+                    cfg.junctions.remove(pos);
+                    if !config::save_config(&cfg) {
+                        rfd::MessageDialog::new()
+                            .set_title("Error")
+                            .set_description("Could not save the config — the folder may still be in the list.")
+                            .set_buttons(rfd::MessageButtons::Ok)
+                            .show();
+                        return;
+                    }
+                }
+                None => return, // already gone — nothing to do
+            }
             a.set_selected_index(-1);
             refresh_folders(&a);
 
@@ -1053,13 +1070,30 @@ Failed: {}", failures.join(", ")));
                     .set_buttons(rfd::MessageButtons::YesNo)
                     .show() == rfd::MessageDialogResult::Yes;
                 if delete_backup {
-                    let _ = std::fs::remove_dir_all(&backup_dir);
-                    let _ = std::fs::remove_dir_all(&versions_dir);
-                    rfd::MessageDialog::new()
-                        .set_title("Done")
-                        .set_description(&format!("'{}' and its backup fully removed.", name))
-                        .set_buttons(rfd::MessageButtons::Ok)
-                        .show();
+                    // M-3: deletion under the global lock — a scheduled sync could
+                    // otherwise race a snapshot hardlink into a dir being deleted.
+                    let mut deleted = false;
+                    match sync::acquire_pair_lock(10_000) {
+                        Some(_lock) => {
+                            let _ = std::fs::remove_dir_all(&backup_dir);
+                            let _ = std::fs::remove_dir_all(&versions_dir);
+                            deleted = true;
+                        }
+                        None => {
+                            rfd::MessageDialog::new()
+                                .set_title("Busy")
+                                .set_description("A sync is running — the backup files could not be deleted now. Remove it again when the sync finishes.")
+                                .set_buttons(rfd::MessageButtons::Ok)
+                                .show();
+                        }
+                    }
+                    if deleted {
+                        rfd::MessageDialog::new()
+                            .set_title("Done")
+                            .set_description(&format!("'{}' and its backup fully removed.", name))
+                            .set_buttons(rfd::MessageButtons::Ok)
+                            .show();
+                    }
                 } else {
                     rfd::MessageDialog::new()
                         .set_title("Removed")
@@ -1292,7 +1326,13 @@ Failed: {}", failures.join(", ")));
             if let Ok(entries) = std::fs::read_dir(&versions_folder) {
                 for entry in entries.flatten() {
                     let name = entry.file_name().to_string_lossy().to_string();
-                    if name.len() == 15 && entry.path().is_dir() {
+                    // L-2: validate AS BYTES before slicing — a multibyte-UTF-8
+                    // 15-char name would panic the GUI event loop mid-slice.
+                    let b = name.as_bytes();
+                    if b.len() == 15 && entry.path().is_dir()
+                        && b[..8].iter().all(|c| c.is_ascii_digit())
+                        && b[8] == b'_'
+                        && b[9..].iter().all(|c| c.is_ascii_digit()) {
                         let formatted = format!(
                             "{}-{}-{} {}:{}:{}",
                             &name[0..4], &name[4..6], &name[6..8],
@@ -1455,8 +1495,8 @@ Failed: {}", failures.join(", ")));
     }
 
     // Shared cache for last health result (avoids schtasks on every 3s tick)
-    let health_cache: std::rc::Rc<std::cell::RefCell<(slint::SharedString, slint::Color)>> =
-        std::rc::Rc::new(std::cell::RefCell::new((" Checking...".into(), slint::Color::from_rgb_u8(76, 175, 80))));
+    let health_cache: std::sync::Arc<std::sync::Mutex<(slint::SharedString, slint::Color)>> =
+        std::sync::Arc::new(std::sync::Mutex::new((" Checking...".into(), slint::Color::from_rgb_u8(76, 175, 80))));
 
     // --- Input dialog OK handler (routes by input-mode) ---
     {
@@ -1474,10 +1514,22 @@ Failed: {}", failures.join(", ")));
                             let mut c2 = config::load_config();
                             c2.sync_interval_minutes = mins;
                             config::save_config(&c2);
-                            std::thread::spawn(move || { sync::register_sync_task(mins); });
+                            // H-1: verify registration actually succeeded before
+                            // claiming it — a failed schtasks silently kept the
+                            // OLD interval while telling the user "Set to X".
+                            let (tx, rx) = std::sync::mpsc::channel();
+                            std::thread::spawn(move || { tx.send(sync::register_sync_task(mins)).ok(); });
+                            let registered = rx.recv_timeout(std::time::Duration::from_secs(20)).unwrap_or(false);
+                            let saved = config::load_config().sync_interval_minutes == mins;
                             rfd::MessageDialog::new()
                                 .set_title("Sync Interval")
-                                .set_description(&format!("Set to {} minute(s).", mins))
+                                .set_description(if registered && saved {
+                                    format!("Set to {} minute(s).", mins)
+                                } else if !saved {
+                                    "Config could not be saved (disk full or OneDrive lock?) — interval NOT changed.".into()
+                                } else {
+                                    "Failed to register the scheduled task — interval NOT applied.".into()
+                                })
                                 .set_buttons(rfd::MessageButtons::Ok)
                                 .show();
                         } else {
@@ -1609,7 +1661,7 @@ Failed: {}", failures.join(", ")));
                     a.set_health_color(slint::Color::from_rgb_u8(200, 140, 0));
                 }
                 _ => {
-                    let cached = cache.borrow();
+                    let cached = cache.lock().unwrap();
                     a.set_health_text(cached.0.clone());
                     a.set_health_color(cached.1);
                 }
@@ -1623,10 +1675,12 @@ Failed: {}", failures.join(", ")));
         let w = app.as_weak();
         let cache = health_cache.clone();
         health_timer.start(slint::TimerMode::Repeated, std::time::Duration::from_secs(30), move || {
-            // Don't overwrite health bar with "OK" while compression/restore is running.
-            // The progress timer (every 3s) handles showing the live progress.
-            if synclog::read_status().map_or(false, |s| s.phase < 3) {
-                // Still update the cache, but don't touch the health bar
+            // L-4: get_health() spawns powershell.exe (0.3-1s) — doing that on the
+            // UI thread stalls the event loop every 30s. Do the work on a thread,
+            // post the result back via the event loop.
+            let w2 = w.clone();
+            let cache_tick = cache.clone(); // FnMut timer: fresh Arc clone per tick
+            std::thread::spawn(move || {
                 let h = health::get_health();
                 let text: slint::SharedString = format!(" {} - {} ", h.label, h.reason).into();
                 let color = match h.status.as_str() {
@@ -1634,21 +1688,18 @@ Failed: {}", failures.join(", ")));
                     "AMBER" => slint::Color::from_rgb_u8(200, 140, 0),
                     _ => slint::Color::from_rgb_u8(200, 30, 30),
                 };
-                *cache.borrow_mut() = (text, color);
-                return;
-            }
-            let h = health::get_health();
-            let text: slint::SharedString = format!(" {} - {} ", h.label, h.reason).into();
-            let color = match h.status.as_str() {
-                "GREEN" => slint::Color::from_rgb_u8(76, 175, 80),
-                "AMBER" => slint::Color::from_rgb_u8(200, 140, 0),
-                _ => slint::Color::from_rgb_u8(200, 30, 30),
-            };
-            *cache.borrow_mut() = (text.clone(), color);
-            if let Some(a) = w.upgrade() {
-                a.set_health_text(text);
-                a.set_health_color(color);
-            }
+                let syncing = synclog::read_status().map_or(false, |s| s.phase < 3);
+                let _ = w2.upgrade_in_event_loop(move |a| {
+                    // Cache write happens on the UI thread.
+                    *cache_tick.lock().unwrap() = (text.clone(), color);
+                    // Don't overwrite health bar with "OK" while a sync runs —
+                    // the progress timer (3s) owns the display then.
+                    if !syncing {
+                        a.set_health_text(text);
+                        a.set_health_color(color);
+                    }
+                });
+            });
 
             // Migration check: only spawn thread if marker exists (cheap file check).
             // Zero threads in steady state.

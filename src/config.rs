@@ -82,17 +82,26 @@ pub fn config_path() -> PathBuf {
 
 /// Save config with path contraction (absolute → portable).
 pub fn save_config(cfg: &Config) -> bool {
-    // L5: returns success — a silently-dropped junction (full disk, OneDrive
-    // lock) was invisible to the user. Callers that ignore the result still
-    // compile (bool is inert), GUI sites now surface the failure.
+    // L5/M-T2: returns success AND logs on failure — a silently-dropped
+    // junction (full disk, OneDrive lock) was invisible to the user.
     let path = config_path();
     let mut cfg = cfg.clone();
     for j in &mut cfg.junctions {
         j.source_path = crate::pathutil::contract(&j.source_path);
     }
     match serde_json::to_string_pretty(&cfg) {
-        Ok(data) => std::fs::write(&path, data).is_ok(),
-        Err(_) => false,
+        Ok(data) => {
+            if std::fs::write(&path, data).is_ok() {
+                true
+            } else {
+                crate::synclog::write("[CONFIG-FAIL] could not write junction-config.json — change NOT saved");
+                false
+            }
+        }
+        Err(_) => {
+            crate::synclog::write("[CONFIG-FAIL] could not serialize config — change NOT saved");
+            false
+        }
     }
 }
 
@@ -281,6 +290,27 @@ pub fn migrate_pair_key(source: &str) {
     if old_v.is_dir() && !new_v.exists() {
         let _ = std::fs::rename(&old_v, &new_v);
     }
+}
+
+// C-1: names the app itself owns under script_dir() — a legacy raw-folder can
+// NEVER be one of these, and a user source named "backup" must not make the
+// migration path compress-and-delete the app's own backup store.
+const RESERVED_LEAVES: &[&str] = &["backup", "_versions", ".lrgex"];
+
+/// C-1: resolves the pre-C2 raw backup folder for a source, SAFELY.
+/// Returns None for reserved names (the app's own store) and for folders that
+/// contain the app's own structure (i.e. the home itself).
+pub fn legacy_raw_folder(source: &str) -> Option<PathBuf> {
+    let leaf = Path::new(source).file_name()?.to_string_lossy().to_string();
+    if RESERVED_LEAVES.iter().any(|r| r.eq_ignore_ascii_case(&leaf)) {
+        return None; // never touch our own store via the legacy path
+    }
+    let p = script_dir().join(&leaf);
+    // A genuine pre-C2 raw backup never contains our own store dirs.
+    if p.join("backup").is_dir() || p.join(".lrgex").is_dir() || p.join("_versions").is_dir() {
+        return None;
+    }
+    if p.is_dir() { Some(p) } else { None }
 }
 
 pub fn trash_path_for(source: &str) -> PathBuf {

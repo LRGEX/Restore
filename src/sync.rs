@@ -27,13 +27,43 @@ pub fn sweep_orphaned_temps() {
         for entry in entries.flatten() {
             let name = entry.file_name().to_string_lossy().to_string();
             if name.starts_with("lrgex_") && name.ends_with(".tar.zst.tmp") {
-                // Parse PID from filename: lrgex_<PID>_<leaf>.tar.zst.tmp
+                // Parse PID from filename: lrgex_<PID>_<leaf>.tar.zst.tmp or
+                // lrgex_<PID>_migrate_<leaf>.tar.zst.tmp (L-6d: unify the prefix).
                 if let Some(pid_str) = name.strip_prefix("lrgex_") {
                     if let Some(pid_end) = pid_str.find('_') {
                         if let Ok(pid) = pid_str[..pid_end].parse::<u32>() {
                             if pid != current_pid && !crate::synclog::is_pid_alive(pid) {
                                 let _ = std::fs::remove_file(entry.path());
                             }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// M-5: killed restores leak full-size `.lrgex_restore_<pid>` staging dirs NEXT
+/// TO the user's source folders (not %TEMP%). Sweep them from every junction's
+/// parent at GUI/-sync startup. Depends on L-3 (ACCESS_DENIED = alive).
+pub fn sweep_orphaned_restore_dirs(cfg: &crate::config::Config) {
+    for j in &cfg.junctions {
+        let parent = match std::path::Path::new(&j.source_path).parent() {
+            Some(p) => p.to_path_buf(),
+            None => continue,
+        };
+        let entries = match std::fs::read_dir(&parent) {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if let Some(pid_part) = name.strip_prefix(".lrgex_restore_") {
+                // <pid>_<seq> — parse the PID prefix, ignore the seq suffix
+                if let Some(pid_str) = pid_part.split('_').next() {
+                    if let Ok(pid) = pid_str.parse::<u32>() {
+                        if pid != std::process::id() && !crate::synclog::is_pid_alive(pid) {
+                            let _ = std::fs::remove_dir_all(entry.path());
                         }
                     }
                 }
@@ -66,10 +96,14 @@ pub fn acquire_pair_lock(timeout_ms: u32) -> Option<PairLock> {
         let h = CreateMutexW(std::ptr::null(), 0, name.as_ptr());
         if h.is_null() { return None; }
         let r = WaitForSingleObject(h, timeout_ms);
-        if r == WAIT_OBJECT_0 {
+        if r == WAIT_OBJECT_0 || r == windows_sys::Win32::Foundation::WAIT_ABANDONED_0 {
+            // WAIT_ABANDONED: previous holder died (the task's own PT2H kill) —
+            // Windows grants US ownership on return. Abandonment cannot corrupt
+            // data (every mutation is temp+rename staged); treating it as "busy"
+            // poisoned exactly the next sync after every crash.
             Some(PairLock { _handle: h })
         } else {
-            // Still busy after timeout — abort, do NOT proceed unlocked.
+            // Genuinely still busy after timeout — abort, do NOT proceed unlocked.
             CloseHandle(h);
             None
         }
@@ -124,9 +158,16 @@ pub struct FileEnt {
 /// SINGLE WALK — replaces compute_stats + collect_files.
 /// Returns (entries, total_bytes, count). Uses DirEntry::metadata() which on
 /// Windows is served from the directory enumeration cache (no extra syscall).
-/// M2: walk_tree now returns unreadable-subtree failures so sync can WARN
-/// instead of silently producing an incomplete backup that looks successful.
-pub fn walk_tree(base: &Path, excluded: &[String]) -> (Vec<FileEnt>, u64, usize) {
+/// M2 + H-2: walk_tree returns None when the ROOT itself is unreadable —
+/// the sync must NOT proceed (an empty archive would replace a good backup,
+/// and a later auto-restore would wipe the user's folder). Subtree failures
+/// are logged ([WALK-WARN]) and excluded, but the root gates everything.
+pub fn walk_tree(base: &Path, excluded: &[String]) -> Option<(Vec<FileEnt>, u64, usize)> {
+    if std::fs::read_dir(base).is_err() {
+        crate::synclog::write(&format!(
+            "[WALK-FAIL] source unreadable — backup ABORTED: {}", base.display()));
+        return None;
+    }
     let mut out = Vec::with_capacity(4096);
     let mut total = 0u64;
     let mut failed_dirs: Vec<String> = Vec::new();
@@ -142,7 +183,7 @@ pub fn walk_tree(base: &Path, excluded: &[String]) -> (Vec<FileEnt>, u64, usize)
         crate::synclog::write(&msg);
     }
     let count = out.len();
-    (out, total, count)
+    Some((out, total, count))
 }
 
 fn walk_inner(base: &Path, current: &Path, excluded: &[String], out: &mut Vec<FileEnt>, total: &mut u64, failed: &mut Vec<String>) {
@@ -198,9 +239,18 @@ mod tests {
     use super::*;
     use std::io::Write;
 
+    /// M-T1: unique-per-invocation fixture tag — PID alone collides when tests
+    /// run in parallel threads of one process. Atomic counter => every call
+    /// unique => suite is deterministic under default `cargo test`.
+    fn tmp_tag() -> String {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static COUNTER: AtomicU32 = AtomicU32::new(0);
+        format!("{}_{}", COUNTER.fetch_add(1, Ordering::SeqCst), std::process::id())
+    }
+
     /// Helper: create a temp test folder with known files
     fn make_test_folder() -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!("lrgex_test_{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("lrgex_test_{}", tmp_tag()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         // Create a subfolder
@@ -218,7 +268,7 @@ mod tests {
     #[test]
     fn test_walk_tree_finds_all_files() {
         let dir = make_test_folder();
-        let (files, total_bytes, count) = walk_tree(&dir, &[]);
+        let (files, total_bytes, count) = walk_tree(&dir, &[]).expect("walk must succeed");
         println!("\n=== WALK_TREE: {} ===", dir.display());
         println!("  files: {}, bytes: {}", count, total_bytes);
         for f in &files {
@@ -239,7 +289,7 @@ mod tests {
     fn test_walk_tree_excludes_names() {
         let dir = make_test_folder();
         let excluded = vec!["node_modules".to_string()];
-        let (_files, _, count) = walk_tree(&dir, &excluded);
+        let (_files, _, count) = walk_tree(&dir, &excluded).expect("walk must succeed");
         println!("\n=== WALK_TREE EXCLUDED ===");
         println!("  files after exclude: {}", count);
         assert_eq!(count, 3, "Should find 3 files (node_modules excluded)");
@@ -255,7 +305,7 @@ mod tests {
             let link = dir.join("symlink.txt");
             let _ = std::os::windows::fs::symlink_file(dir.join("file1.txt"), &link);
         }
-        let (_files, _, count) = walk_tree(&dir, &[]);
+        let (_files, _, count) = walk_tree(&dir, &[]).expect("walk must succeed");
         println!("\n=== WALK_TREE SYMLINKS ===");
         println!("  files: {} (symlinks should be skipped)", count);
         assert_eq!(count, 4, "Symlink should be skipped, still 4 files");
@@ -264,10 +314,10 @@ mod tests {
 
     #[test]
     fn test_walk_tree_empty_folder() {
-        let dir = std::env::temp_dir().join(format!("lrgex_empty_{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("lrgex_empty_{}", tmp_tag()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let (files, bytes, count) = walk_tree(&dir, &[]);
+        let (files, bytes, count) = walk_tree(&dir, &[]).expect("walk must succeed");
         assert_eq!(count, 0, "Empty folder should have 0 files");
         assert_eq!(bytes, 0, "Empty folder should have 0 bytes");
         assert!(files.is_empty(), "File list should be empty");
@@ -276,12 +326,12 @@ mod tests {
 
     #[test]
     fn test_walk_tree_byte_count_accurate() {
-        let dir = std::env::temp_dir().join(format!("lrgex_bytes_{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("lrgex_bytes_{}", tmp_tag()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("a.txt"), b"12345").unwrap(); // 5 bytes
         std::fs::write(dir.join("b.txt"), b"1234567890").unwrap(); // 10 bytes
-        let (_, total, count) = walk_tree(&dir, &[]);
+        let (_, total, count) = walk_tree(&dir, &[]).expect("walk must succeed");
         assert_eq!(count, 2);
         assert_eq!(total, 15, "Total bytes should be 15 (5+10)");
         let _ = std::fs::remove_dir_all(&dir);
@@ -304,7 +354,7 @@ mod tests {
         println!("  Compressed: {} bytes, {} skipped", dest.metadata().unwrap().len(), skipped.len());
 
         // Decompress to a temp folder
-        let extract_dir = std::env::temp_dir().join(format!("lrgex_test_extract_{}", std::process::id()));
+        let extract_dir = std::env::temp_dir().join(format!("lrgex_test_extract_{}", tmp_tag()));
         let _ = std::fs::remove_dir_all(&extract_dir);
         std::fs::create_dir_all(&extract_dir).unwrap();
         let (decompressed_ok, msg) = decompress_archive(&dest, &extract_dir);
@@ -341,7 +391,7 @@ mod tests {
         assert!(ok, "Compression with exclusions should succeed");
 
         // Decompress + verify node_modules is NOT in the archive
-        let extract_dir = std::env::temp_dir().join(format!("lrgex_test_excl_extract_{}", std::process::id()));
+        let extract_dir = std::env::temp_dir().join(format!("lrgex_test_excl_extract_{}", tmp_tag()));
         let _ = std::fs::remove_dir_all(&extract_dir);
         std::fs::create_dir_all(&extract_dir).unwrap();
         let (dec_ok, _) = decompress_archive(&dest, &extract_dir);
@@ -360,7 +410,7 @@ mod tests {
 
     #[test]
     fn test_compress_large_file_streaming() {
-        let dir = std::env::temp_dir().join(format!("lrgex_large_{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("lrgex_large_{}", tmp_tag()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
 
@@ -378,7 +428,7 @@ mod tests {
         assert!(ok, "Large file compression should succeed");
 
         // Decompress + verify size
-        let extract_dir = std::env::temp_dir().join(format!("lrgex_large_extract_{}", std::process::id()));
+        let extract_dir = std::env::temp_dir().join(format!("lrgex_large_extract_{}", tmp_tag()));
         let _ = std::fs::remove_dir_all(&extract_dir);
         std::fs::create_dir_all(&extract_dir).unwrap();
         let (dec_ok, _) = decompress_archive(&dest, &extract_dir);
@@ -418,7 +468,7 @@ mod tests {
         println!("\n=== HERMES ARCHIVE VERIFICATION ===");
         println!("  Archive: {} ({} MB)", archive.display(), archive.metadata().unwrap().len() / 1_048_576);
 
-        let extract_dir = std::env::temp_dir().join(format!("lrgex_hermes_verify_{}", std::process::id()));
+        let extract_dir = std::env::temp_dir().join(format!("lrgex_hermes_verify_{}", tmp_tag()));
         let _ = std::fs::remove_dir_all(&extract_dir);
         std::fs::create_dir_all(&extract_dir).unwrap();
 
@@ -455,6 +505,22 @@ mod tests {
         files
     }
 
+    #[test]
+    fn test_interval_xml() {
+        // H-1 regression: the T designator is MANDATORY — P30M = 30 months!
+        assert_eq!(interval_xml(1),    "PT1M");
+        assert_eq!(interval_xml(30),   "PT30M");
+        assert_eq!(interval_xml(60),   "PT1H");
+        assert_eq!(interval_xml(90),   "PT1H30M");
+        assert_eq!(interval_xml(1440), "P1D");
+        assert_eq!(interval_xml(1500), "P1DT1H");
+        assert_eq!(interval_xml(2880), "P2D");
+        assert_eq!(interval_xml(1441), "P1DT1M"); // d>0, h=0, min>0 — T still emitted
+        assert_eq!(interval_xml(4321), "P3DT1M");
+        assert_eq!(interval_xml(0),    "PT1M");  // clamped
+        assert_eq!(interval_xml(-5),   "PT1M");  // clamped
+    }
+
     // ============ CONTENT-HASH MANIFEST TESTS ============
     // Unit tests on the pure logic — no shared .lrgex state, parallel-safe.
 
@@ -471,7 +537,7 @@ mod tests {
     fn test_detect_change_same_size_different_content() {
         // THE bug this whole feature fixes: same size, different content.
         let dir = std::env::temp_dir()
-            .join(format!("lrgex_manifest_1_{}", std::process::id()));
+            .join(format!("lrgex_manifest_1_{}", tmp_tag()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let f = dir.join("config.json");
@@ -492,7 +558,7 @@ mod tests {
 
     #[test]
     fn test_detect_change_identical_content() {
-        let dir = std::env::temp_dir().join(format!("lrgex_manifest_2_{}", std::process::id()))
+        let dir = std::env::temp_dir().join(format!("lrgex_manifest_2_{}", tmp_tag()))
             .join("m2");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -512,7 +578,7 @@ mod tests {
 
     #[test]
     fn test_detect_change_file_added() {
-        let dir = std::env::temp_dir().join(format!("lrgex_manifest_3_{}", std::process::id()))
+        let dir = std::env::temp_dir().join(format!("lrgex_manifest_3_{}", tmp_tag()))
             .join("m3");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -537,7 +603,7 @@ mod tests {
         // (b) stored real hash + currently locked => UNCHANGED (size-only compare;
         //     a permanently-locked file must not loop re-backups forever).
         let dir = std::env::temp_dir()
-            .join(format!("lrgex_manifest_4_{}", std::process::id()))
+            .join(format!("lrgex_manifest_4_{}", tmp_tag()))
             .join("m4");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -570,7 +636,7 @@ mod tests {
 
     #[test]
     fn test_manifest_sidecar_roundtrip() {
-        let dir = std::env::temp_dir().join(format!("lrgex_manifest_5_{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("lrgex_manifest_5_{}", tmp_tag()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let sidecar = dir.join("sidecar.txt");
@@ -602,7 +668,7 @@ mod tests {
     fn test_old_sidecar_migration() {
         // Old "size,count" format: read_stored_stats parses it, read_stored_manifest
         // returns None => detection treats it as changed => re-backup + write manifest.
-        let dir = std::env::temp_dir().join(format!("lrgex_manifest_6_{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("lrgex_manifest_6_{}", tmp_tag()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let sidecar = dir.join("old_sidecar.txt");
@@ -620,7 +686,7 @@ mod tests {
 
     #[test]
     fn test_hash_file_deterministic() {
-        let dir = std::env::temp_dir().join(format!("lrgex_manifest_7_{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("lrgex_manifest_7_{}", tmp_tag()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let f = dir.join("x.bin");
@@ -644,7 +710,7 @@ mod tests {
     #[test]
     fn test_restore_invariance_e2e() {
         // Leaf is derived from the source folder name — pid-unique already.
-        let src = std::env::temp_dir().join(format!("lrgex_e2e_{}", std::process::id()));
+        let src = std::env::temp_dir().join(format!("lrgex_e2e_{}", tmp_tag()));
         let leaf = src.file_name().unwrap().to_string_lossy().to_string();
         let _ = std::fs::remove_dir_all(&src);
         std::fs::create_dir_all(src.join("nested")).unwrap();
@@ -720,7 +786,10 @@ pub fn compress_folder(
     let t_walk = std::time::Instant::now();
     let (files, total_bytes, count) = match prewalked {
         Some(w) => w,
-        None => walk_tree(source, excluded),
+        None => match walk_tree(source, excluded) {
+            Some(w) => w,
+            None => return (false, vec![]),
+        },
     };
     let walk = t_walk.elapsed();
     progress.set_totals(count, total_bytes);
@@ -841,7 +910,13 @@ impl std::io::Read for CountingReader {
 pub fn decompress_archive(archive: &Path, dest: &Path) -> (bool, String) {
     let _ = std::fs::create_dir_all(dest);
     let temp_dir = dest.parent().unwrap_or(std::path::Path::new("."))
-        .join(format!(".lrgex_restore_{}", std::process::id()));
+        .join(format!(".lrgex_restore_{}_{}", std::process::id(), {
+            // Unique per call: parallel decompressions in one process (tests, or a
+            // restore racing a snapshot restore) must not share a staging dir.
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static SEQ: AtomicU64 = AtomicU64::new(0);
+            SEQ.fetch_add(1, Ordering::SeqCst)
+        }));
     let _ = std::fs::remove_dir_all(&temp_dir);
     let _ = std::fs::create_dir_all(&temp_dir);
     // M5: mark staging HIDDEN + TEMPORARY (attrib) — OneDrive/Syncthing watchers
@@ -1143,20 +1218,23 @@ pub fn sync_pair_to_cloud(source: &str, excluded: &[String], max_versions: i32, 
         let _ = std::fs::remove_file(&old_root_sidecar);
     }
 
-    // C4: legacy raw-folder migration — compress to TEMP, rename into place, and
-    // ONLY delete the raw folder on verified success. The raw folder may be the
-    // user's ONLY copy; a failed compress + unconditional delete = total loss.
-    let old_backup_folder = config::script_dir().join(&leaf);
-    if old_backup_folder.is_dir() && !backup_7z.exists() {
-        let tmp = std::env::temp_dir()
-            .join(format!("lrgex_migrate_{}_{}.tar.zst.tmp", std::process::id(), leaf));
-        let (ok, _) = compress_folder(&old_backup_folder, &tmp, excluded, None);
-        if ok && std::fs::rename(&tmp, &backup_7z).is_ok() {
-            let _ = std::fs::remove_dir_all(&old_backup_folder);
-        } else {
-            let _ = std::fs::remove_file(&tmp);
-            crate::synclog::write(&format!(
-                "  [MIGRATE-FAIL] kept raw folder for {} (compress failed)", leaf));
+    // C4/C-1: legacy raw-folder migration — SAFE resolver refuses reserved names
+    // (backup/_versions/.lrgex) and the home itself, so protecting a folder named
+    // "backup" can never compress-and-delete the app's own backup store.
+    // Compress to TEMP, rename into place, delete raw folder ONLY on success.
+    if let Some(old_backup_folder) = config::legacy_raw_folder(source) {
+        if !backup_7z.exists() {
+            // L-6d: lrgex_<pid>_migrate_* prefix so the orphan sweep can parse it
+            let tmp = std::env::temp_dir()
+                .join(format!("lrgex_{}_migrate_{}.tar.zst.tmp", std::process::id(), leaf));
+            let (ok, _) = compress_folder(&old_backup_folder, &tmp, excluded, None);
+            if ok && std::fs::rename(&tmp, &backup_7z).is_ok() {
+                let _ = std::fs::remove_dir_all(&old_backup_folder);
+            } else {
+                let _ = std::fs::remove_file(&tmp);
+                crate::synclog::write(&format!(
+                    "  [MIGRATE-FAIL] kept raw folder for {} (compress failed)", leaf));
+            }
         }
     }
 
@@ -1165,7 +1243,41 @@ pub fn sync_pair_to_cloud(source: &str, excluded: &[String], max_versions: i32, 
     // 2. CONTENT: sizes match => one full parallel hash pass. Catches same-size edits.
     //    Old-format sidecar (no "manifest:" prefix) => migration: treat as changed once.
     //    The manifest computed here is REUSED at the write site — one hash pass total.
-    let walked = walk_tree(Path::new(source), excluded);
+    // H-2: root-unreadable => ABORT. An empty archive would replace a good
+    // backup, and the next auto-restore would wipe the user's folder.
+    let walked = match walk_tree(Path::new(source), excluded) {
+        Some(w) => w,
+        None => return (false, "source unreadable — refusing to overwrite the backup with an empty archive".into()),
+    };
+    // M-6: NEVER archive the app's own home (archive-of-archives = unbounded
+    // growth + OneDrive re-upload storms). Filter walked entries under script_dir.
+    let home = config::script_dir();
+    let (files, mut current_size, mut current_count) = walked;
+    let filtered: Vec<crate::sync::FileEnt> = files.into_iter()
+        .filter(|e| {
+            let under_home = e.path.starts_with(&home);
+            if under_home {
+                crate::synclog::write(&format!("  [EXCLUDE] home folder member skipped: {}", e.path.display()));
+            }
+            !under_home
+        })
+        .collect();
+    if filtered.len() != current_count {
+        current_size = filtered.iter().map(|e| e.size).sum();
+        current_count = filtered.len();
+    }
+    let walked = (filtered, current_size, current_count);
+    // H-2 belt-and-braces: a genuine source with ZERO files when a non-empty
+    // backup exists => suspicious (root race, mass deletion) — refuse to
+    // destroy the chain silently. Log loudly; user can force via Remove+re-add.
+    if walked.2 == 0 && backup_7z.exists() {
+        let (_, stored_count) = read_stored_stats(&sidecar);
+        if stored_count > 0 {
+            crate::synclog::write(&format!(
+                "  [GUARD] {} reads as EMPTY but backup holds {} files — refusing to archive an empty set", leaf, stored_count));
+            return (false, "source suddenly empty — backup NOT overwritten (possible read failure)".into());
+        }
+    }
     let current_size = walked.1;
     let current_count = walked.2;
     let (stored_size, stored_count) = read_stored_stats(&sidecar);
@@ -1225,9 +1337,27 @@ pub fn sync_pair_to_cloud(source: &str, excluded: &[String], max_versions: i32, 
             } else {
                 // Rename failed (OneDrive lock?) — try copy + delete
                 if std::fs::copy(&temp_7z, &backup_7z).is_ok() {
-                    let _ = std::fs::remove_file(&temp_7z);
-                    clean_versions(&versions_folder, max_versions as usize); // L1: after success
-                    write_stored_manifest(&sidecar, &m);
+                    // M-2: copy is NOT atomic — verify size match + zstd decodability
+                    // before trusting it. A torn copy with the OLD sidecar intact
+                    // would read "No changes" forever on a dead archive.
+                    let temp_len = std::fs::metadata(&temp_7z).map(|m| m.len()).unwrap_or(u64::MAX);
+                    let dest_len = std::fs::metadata(&backup_7z).map(|m| m.len()).unwrap_or(0);
+                    let decode_ok = std::fs::File::open(&backup_7z)
+                        .ok()
+                        .and_then(|f| zstd::stream::read::Decoder::new(f).ok())
+                        .is_some();
+                    if temp_len == dest_len && decode_ok {
+                        let _ = std::fs::remove_file(&temp_7z);
+                        clean_versions(&versions_folder, max_versions as usize); // L1: after success
+                        write_stored_manifest(&sidecar, &m);
+                    } else {
+                        let _ = std::fs::remove_file(&temp_7z);
+                        // The torn copy ALREADY replaced backup_7z — the good copy
+                        // survives only in the pre-change snapshot. Say so, loudly.
+                        crate::synclog::write(&format!(
+                            "  [VERIFY-FAIL] copy of {} was torn — live archive DAMAGED; good copy is in _versions", leaf));
+                        return (false, "archive damaged during copy — restore from Versions".into());
+                    }
                 } else {
                     let _ = std::fs::remove_file(&temp_7z);
                     return (false, "rename failed".into());
@@ -1265,7 +1395,9 @@ pub fn pre_check_restore(paths: &[String]) -> Vec<(String, String)> {
         let leaf = std::path::Path::new(path).file_name()
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_default();
-        config::migrate_pair_key(path); // C2: pre-check must see migrated paths too
+        // L-1: do NOT migrate here — restore_pair_from_cloud migrates under the
+        // lock; an unlocked rename from the pre-check violates C3 and converges
+        // to a redundant re-backup at best, a lost race at worst.
         let backup = config::backup_file_for(path);
 
         // 1. Backup archive exists?
@@ -1329,27 +1461,33 @@ pub fn restore_pair_from_cloud(source: &str) -> (bool, String) {
     }
 
     // Fallback: old raw folder format
-    let old_backup = config::script_dir().join(&leaf);
-    if old_backup.exists() {
-        let _ = std::fs::create_dir_all(source);
-        let args: Vec<String> = vec![
-            old_backup.to_string_lossy().to_string(), source.into(),
-            "/E".into(), "/XJ".into(), "/NFL".into(), "/NDL".into(),
-            "/NJH".into(), "/NJS".into(), "/NP".into(), "/R:5".into(), "/W:5".into(),
-        ];
-        let output = Command::new("robocopy.exe").args(&args)
-            .creation_flags(0x08000000).output();
-        return match output {
-            Ok(out) => {
-                let code = out.status.code().unwrap_or(16);
-                if code < 8 { (true, String::new()) }
-                else { (false, format!("robocopy exit {}", code)) }
-            }
-            Err(e) => (false, e.to_string()),
-        };
+    // C-1: safe resolver — never robocopy from the app's own store (reserved
+    // names / home structure) into a user source folder.
+    if let Some(old_backup) = config::legacy_raw_folder(source) {
+        return robocopy_tree(&old_backup, source);
     }
 
     (false, "backup missing".into())
+}
+
+/// L-8: single robocopy-tree helper (was duplicated verbatim in two restores).
+pub fn robocopy_tree(src: &Path, dst: &str) -> (bool, String) {
+    let _ = std::fs::create_dir_all(dst);
+    let args: Vec<String> = vec![
+        src.to_string_lossy().to_string(), dst.into(),
+        "/E".into(), "/XJ".into(), "/NFL".into(), "/NDL".into(),
+        "/NJH".into(), "/NJS".into(), "/NP".into(), "/R:5".into(), "/W:5".into(),
+    ];
+    let output = Command::new("robocopy.exe").args(&args)
+        .creation_flags(0x08000000).output();
+    match output {
+        Ok(out) => {
+            let code = out.status.code().unwrap_or(16);
+            if code < 8 { (true, String::new()) }
+            else { (false, format!("robocopy exit {}", code)) }
+        }
+        Err(e) => (false, e.to_string()),
+    }
 }
 
 pub fn sync_all_pairs() {
@@ -1369,7 +1507,7 @@ pub fn sync_all_pairs() {
         let missing = !Path::new(&j.source_path).exists() || is_dir_empty(&j.source_path);
 
         if missing && j.auto_restore {
-            let (success, _) = restore_pair_from_cloud(&j.source_path);
+            let (success, reason) = restore_pair_from_cloud(&j.source_path);
             if success {
                 restored += 1;
                 restored_names.push(leaf.clone());
@@ -1379,6 +1517,9 @@ pub fn sync_all_pairs() {
                 // Also try migration now (game might have already created new ID)
                 let mig = migrate_save_ids(Path::new(&j.source_path));
                 for m in &mig { crate::synclog::write(&format!("  [MIGRATE] {}", m)); }
+            } else if reason.contains("another LRGEX operation") {
+                // M-4: lock held by a concurrent GUI operation — skip, not fail
+                crate::synclog::write(&format!("  [SKIP] {}  -  concurrent operation holds the lock", leaf));
             } else {
                 fail += 1;
                 crate::synclog::write(&format!("  [FAIL] {}  -  restore failed", leaf));
@@ -1396,8 +1537,15 @@ pub fn sync_all_pairs() {
                     for m in &mig { crate::synclog::write(&format!("  [MIGRATE] {}", m)); }
                 }
             } else {
-                fail += 1;
-                crate::synclog::write(&format!("  [FAIL] {}  -  {}", leaf, reason));
+                // M-4: lock-timeout is NOT a failure — a long GUI restore holding the
+                // global lock made every overlapping scheduled cycle report a
+                // false RED. Skip, don't fail.
+                if reason.contains("another LRGEX operation") {
+                    crate::synclog::write(&format!("  [SKIP] {}  -  concurrent operation holds the lock", leaf));
+                } else {
+                    fail += 1;
+                    crate::synclog::write(&format!("  [FAIL] {}  -  {}", leaf, reason));
+                }
             }
         }
     }
@@ -1430,21 +1578,7 @@ pub fn restore_snapshot(snapshot_dir: &Path, source: &str) -> (bool, String) {
         }
     }
     // Fallback: old-style raw files snapshot
-    let args: Vec<String> = vec![
-        snapshot_dir.to_string_lossy().to_string(), source.into(),
-        "/E".into(), "/XJ".into(), "/NFL".into(), "/NDL".into(),
-        "/NJH".into(), "/NJS".into(), "/NP".into(), "/R:5".into(), "/W:5".into(),
-    ];
-    let output = Command::new("robocopy.exe").args(&args)
-        .creation_flags(0x08000000).output();
-    match output {
-        Ok(out) => {
-            let code = out.status.code().unwrap_or(16);
-            if code < 8 { (true, String::new()) }
-            else { (false, format!("robocopy exit {}", code)) }
-        }
-        Err(e) => (false, e.to_string()),
-    }
+    robocopy_tree(snapshot_dir, source)
 }
 
 /// List files inside a .tar.zst archive (without extracting)
@@ -1460,6 +1594,24 @@ pub fn restore_snapshot(snapshot_dir: &Path, source: &str) -> (bool, String) {
 /// Delete old VBS-based scheduled tasks from the PowerShell version.
 /// Prevents "cannot find sync-runner.vbs" errors for users upgrading from old version.
 /// Scans every launch on background thread. Catches old VBS tasks from any previous version.
+/// H-1: exact ISO-8601 duration (pure — unit-tested). Time designator T is
+/// REQUIRED before any H/M component; without it P30M means 30 MONTHS and
+/// schtasks rejects the XML silently. Days precede T: P1DT2H30M.
+pub fn interval_xml(minutes: i64) -> String {
+    let m = minutes.max(1) as u64;
+    let (d, h, min) = (m / 1440, (m % 1440) / 60, m % 60);
+    let mut s = String::from("P");
+    if d > 0 { s.push_str(&format!("{}D", d)); }
+    let has_time = h > 0 || min > 0 || d == 0; // exact-days edge: P1D stays P1D
+    if has_time {
+        s.push('T');
+        if h > 0 { s.push_str(&format!("{}H", h)); }
+        if min > 0 { s.push_str(&format!("{}M", min)); }
+        if h == 0 && min == 0 { s.push_str("0M"); } // d==0 && m<60 && h==0 && min==0 can't happen (m>=1), but P<1H alone is never emitted
+    }
+    s
+}
+
 pub fn register_sync_task(interval_minutes: i32) -> bool {
     let home = match config::canonical_home() {
         Some(h) => h,
@@ -1471,18 +1623,7 @@ pub fn register_sync_task(interval_minutes: i32) -> bool {
     // XML task definition — uses StartWhenAvailable=true so missed runs
     // (PC off/asleep) are caught up on wake. This is the ROOT FIX for
     // stale backups on machines that sleep at the scheduled time.
-    // L3: exact duration — integer-dividing to hours silently truncated
-    // (90min became PT1H=60min). ISO 8601: days go BEFORE the T (P1DT2H3M).
-    let m = interval_minutes.max(1) as u64;
-    let (d, h, min) = (m / 1440, (m % 1440) / 60, m % 60);
-    let mut parts: Vec<String> = Vec::new();
-    if d > 0 { parts.push(format!("{}D", d)); }
-    let mut t = String::new();
-    if h > 0 { t.push_str(&format!("{}H", h)); }
-    if min > 0 { t.push_str(&format!("{}M", min)); }
-    if !t.is_empty() { parts.push(t); }
-    if parts.is_empty() { parts.push("0M".into()); }
-    let interval_xml = format!("P{}", parts.join("T"));
+    let interval_xml = interval_xml(interval_minutes as i64);
 
     // Escape XML special chars in the exe path.
     let exe_escaped = exe_str
