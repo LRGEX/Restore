@@ -785,7 +785,14 @@ pub fn run() {
                         cfg.junctions.push(config::Junction {
                             source_path: p.clone(), auto_restore: ar, created: synclog::timestamp(), is_game: false,
                         });
-                        config::save_config(&cfg);
+                        if !config::save_config(&cfg) {
+                            rfd::MessageDialog::new()
+                                .set_title("Error")
+                                .set_description("Could not save the config (disk full or OneDrive lock?) — the folder was NOT added.")
+                                .set_buttons(rfd::MessageButtons::Ok)
+                                .show();
+                            return;
+                        }
 
                         // Immediately backup the newly added folder — don't wait for interval
                         crate::synclog::write_progress(&format!("Compressing {}...", leaf));
@@ -849,7 +856,14 @@ pub fn run() {
                 c2.junctions.push(config::Junction {
                     source_path: path.clone(), auto_restore: ar, created: synclog::timestamp(), is_game: false,
                 });
-                config::save_config(&c2);
+                if !config::save_config(&c2) {
+                    rfd::MessageDialog::new()
+                        .set_title("Error")
+                        .set_description("Could not save the config (disk full or OneDrive lock?) — the folder was NOT added.")
+                        .set_buttons(rfd::MessageButtons::Ok)
+                        .show();
+                    return;
+                }
                 a.set_operation_running(true);
                 a.set_status_text(format!("Compressing {}...", leaf).into());
                 let w3 = w.clone();
@@ -1236,11 +1250,15 @@ Failed: {}", failures.join(", ")));
                     let raw = raw.strip_prefix('\u{feff}').unwrap_or(&raw);
                     match serde_json::from_str::<config::Config>(raw) {
                         Ok(cfg) => {
-                            config::save_config(&cfg);
+                            let imported = config::save_config(&cfg);
                             w.upgrade_in_event_loop(|a| { refresh_folders(&a); }).ok();
                             rfd::MessageDialog::new()
-                                .set_title("Import Complete")
-                                .set_description("Configuration imported successfully.")
+                                .set_title(if imported { "Import Complete" } else { "Import Failed" })
+                                .set_description(if imported {
+                                    "Configuration imported successfully."
+                                } else {
+                                    "Import parsed but could not be saved (disk full or OneDrive lock?) — NOTHING changed."
+                                })
                                 .set_buttons(rfd::MessageButtons::Ok)
                                 .show();
                         }

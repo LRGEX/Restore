@@ -65,7 +65,14 @@ fn main() {
         // L2: normalized dedup — see config::same_path (contracted vs expanded aware)
         cfg.junctions.retain(|j| !config::same_path(&j.source_path, &link_path));
         cfg.junctions.push(config::Junction { source_path: link_path.clone(), auto_restore: true, created: synclog::timestamp(), is_game: false });
-        config::save_config(&cfg);
+        if !config::save_config(&cfg) {
+            rfd::MessageDialog::new()
+                .set_title("Error")
+                .set_description("Could not save the config (disk full or OneDrive lock?) — the folder was NOT added.")
+                .set_buttons(rfd::MessageButtons::Ok)
+                .show();
+            return;
+        }
         let (ok, reason) = sync::sync_pair_to_cloud(&link_path, &cfg.excluded_names, cfg.max_versions, true);
         if ok {
             crate::health::write_status(1, 0, 0, &[]);
