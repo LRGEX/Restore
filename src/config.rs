@@ -283,13 +283,45 @@ pub fn same_path(a: &str, b: &str) -> bool {
 /// Hash base is the CONTRACTED form (pathutil::contract) — stable across
 /// username changes (the app's core purpose). contract() is idempotent on
 /// already-contracted input (contracting a contracted path is identity).
+/// ROOT-CAUSE GUARD (the Saved Games incident): every string that becomes a
+/// Windows path component passes through here. Replaces illegal chars
+/// (<>:"/\|?* and control chars), strips trailing dots/spaces, and neutralizes
+/// reserved device names (CON, NUL, COM1…). A token leak like
+/// %KNOWNFOLDER:SavedGames% (colon!) can never produce an invalid path again.
+pub fn safe_filename(name: &str) -> String {
+    let mut s: String = name.chars()
+        .map(|c| match c {
+            '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*' => '_',
+            c if (c as u32) < 0x20 => '_',
+            c => c,
+        })
+        .collect();
+    while s.ends_with('.') || s.ends_with(' ') { s.pop(); }
+    // Reserved device names — bare or with an extension stem
+    let lower = s.to_lowercase();
+    let stem = lower.split('.').next().unwrap_or("");
+    let reserved = matches!(stem, "con" | "prn" | "aux" | "nul")
+        || (stem.len() >= 4
+            && (stem.starts_with("com") || stem.starts_with("lpt"))
+            && stem[3..].parse::<u32>().map(|n| (1..=9).contains(&n)).unwrap_or(false));
+    if reserved { s.push_str("_lrgex"); }
+    if s.is_empty() { s = "pair".into(); }
+    s
+}
+
+/// Collision-proof + reinstall-stable storage key for a junction source path.
+/// Hash base is the CONTRACTED form (pathutil::contract) — stable across
+/// username changes (the app's core purpose). The DISPLAY leaf comes from the
+/// EXPANDED path: a junction that IS a known-folder root (e.g. Saved Games →
+/// %KNOWNFOLDER:SavedGames%) has no trailing component, and taking the leaf
+/// from the token leaked a COLON into the folder name — Windows rejects it.
 pub fn pair_key(source: &str) -> String {
     let contracted = crate::pathutil::contract(source);
-    let leaf = match Path::new(&contracted).file_name() {
+    let leaf = match Path::new(source).file_name() {
         Some(n) => n.to_string_lossy().to_string(),
         None => "pair".into(),
     };
-    format!("{}_{}", leaf, fnv1a_hex(&contracted))
+    format!("{}_{}", safe_filename(&leaf), fnv1a_hex(&contracted))
 }
 
 /// One-time migration: if the old leaf-only dir exists and the new keyed dir
@@ -362,4 +394,71 @@ pub fn backup_file_for(source: &str) -> PathBuf {
 pub fn sidecar_for(source: &str) -> PathBuf {
     let key = pair_key(source);
     script_dir().join("backup").join(&key).join(format!("{}.tar.zst.size", key))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// THE regression: a junction that IS a known-folder root (Saved Games)
+    /// leaked its token — and its COLON — into the folder name, which Windows
+    /// rejects. The key must derive its leaf from the EXPANDED path and NEVER
+    /// contain an illegal filename character.
+    #[test]
+    fn test_pair_key_known_folder_root_no_illegal_chars() {
+        // Real-world shape from the incident (expanded path of the token):
+        let key = pair_key(r"C:\Users\lrg4you\Saved Games");
+        assert!(key.starts_with("Saved Games_"), "leaf must be the real folder name: {}", key);
+        assert!(!key.contains(':'), "colon must never appear in a key: {}", key);
+        assert!(!key.contains('\\') && !key.contains('/'), "no separators: {}", key);
+    }
+
+    /// CLASS GUARD: any derived key is a legal Windows path component.
+    #[test]
+    fn test_pair_key_always_legal_filename() {
+        for src in [
+            r"C:\Users\x\Saved Games",
+            r"C:\Users\x\hermes",
+            r"D:\Games\weird?name<>",
+            r"E:\a|b*c",
+            "%KNOWNFOLDER:SavedGames%",          // raw token passed as source
+            "%LOCALAPPDATA%\\app dir",
+            r"C:\",                                // drive root — no leaf
+        ] {
+            let key = pair_key(src);
+            assert!(!key.is_empty());
+            for c in key.chars() {
+                assert!(
+                    !matches!(c, '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*'),
+                    "illegal char {:?} in key {} for source {}", c, key, src
+                );
+                assert!((c as u32) >= 0x20, "control char in key {} for {}", key, src);
+            }
+            assert!(!key.ends_with('.') && !key.ends_with(' '), "trailing dot/space: {} for {}", key, src);
+        }
+    }
+
+    #[test]
+    fn test_safe_filename_matrix() {
+        assert_eq!(safe_filename("%KNOWNFOLDER:SavedGames%"), "%KNOWNFOLDER_SavedGames%");
+        assert_eq!(safe_filename("a/b\\c"), "a_b_c");
+        assert_eq!(safe_filename("trailing.. "), "trailing");
+        assert_eq!(safe_filename("CON"), "CON_lrgex");
+        assert_eq!(safe_filename("com1.txt"), "com1.txt_lrgex");
+        assert!(safe_filename("").starts_with("pair"));
+        assert_eq!(safe_filename("lpt9"), "lpt9_lrgex");
+        assert_eq!(safe_filename("lpt10"), "lpt10"); // 10+ not reserved
+    }
+
+    /// Stability contract: the same folder under two usernames contracts to
+    /// the same token → same hash → same key (restore-after-reinstall works).
+    /// Simulated without env access: contract() leaves non-matching paths as-is.
+    #[test]
+    fn test_pair_key_deterministic() {
+        let a = pair_key(r"E:\Games\MySaves");
+        let b = pair_key(r"E:\Games\MySaves");
+        let c = pair_key(r"E:\Games\OtherSaves");
+        assert_eq!(a, b, "same source must produce the same key");
+        assert_ne!(a, c, "different sources must not collide");
+    }
 }

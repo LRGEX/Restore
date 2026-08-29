@@ -1,5 +1,14 @@
 # Patch Notes — LRGEX Restore
 
+## v1.5.1 — Saved Games backup fix (known-folder-root bug)
+
+### Fixed
+- Protecting a folder that IS a Windows known-folder root (e.g. **Saved Games**, `%KNOWNFOLDER:SavedGames%`) failed with "rename failed" — the backup folder key leaked the token's colon, which Windows forbids in folder names. The key now derives its name from the real folder path; affected backups migrate automatically on the next sync.
+
+### Hardened (root-cause class guard)
+- Every derived folder/file name now passes a single sanitizer: illegal characters, trailing dots/spaces, and reserved device names (CON, NUL, COM1…) are neutralized — no future token/unicode leak can ever produce an invalid path
+- New test matrix locks the guarantee in (34 tests total)
+
 ## v1.5.0 — Security & integrity hardening (3 audit cycles)
 
 ### Content-hash change detection
