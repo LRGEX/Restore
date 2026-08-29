@@ -3,8 +3,7 @@
 ## v1.5.2 — Transparency fix + non-blocking updates
 
 ### Fixed the "window goes transparent" bug
-- Upgraded the UI renderer (Slint 1.10 → 1.17) — includes upstream fixes for windows rendering see-through after sleep/display changes
-- Visually verified at runtime on Windows
+- Upgraded the UI renderer (Slint 1.10 → 1.17.1) — brings 7 minors of renderer/dirty-region fixes targeting this bug class (rendering verified at runtime; if transparency still recurs on your machine, please report it)
 
 ### Updates never freeze the app again
 - The entire update flow (download → verify → install) now runs on a background thread — a slow or stalled network can no longer freeze the window "(Not Responding)"
