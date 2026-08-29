@@ -563,12 +563,12 @@ mod tests {
         // Backup state: "AAAAAA"
         std::fs::write(&f, b"AAAAAA").unwrap();
         let files = vec![ent(&f, &dir)];
-        let stored = compute_manifest(&files);
+        let stored = compute_manifest(&files, None);
 
         // User edits to "BBBBBB" — SAME SIZE, DIFFERENT CONTENT
         std::fs::write(&f, b"BBBBBB").unwrap();
         let files2 = vec![ent(&f, &dir)];
-        let (changed, _) = detect_change(&stored, &files2);
+        let (changed, _) = detect_change(&stored, &files2, None);
         assert!(changed, "Same-size content edit MUST be detected");
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -584,11 +584,11 @@ mod tests {
 
         std::fs::write(&f, b"game save v1").unwrap();
         let files = vec![ent(&f, &dir)];
-        let stored = compute_manifest(&files);
+        let stored = compute_manifest(&files, None);
 
         // Nothing changed — same files re-hashed
         let files2 = vec![ent(&f, &dir)];
-        let (changed, _) = detect_change(&stored, &files2);
+        let (changed, _) = detect_change(&stored, &files2, None);
         assert!(!changed, "Identical content must NOT trigger a backup");
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -604,10 +604,10 @@ mod tests {
         let f2 = dir.join("b.txt");
 
         std::fs::write(&f1, b"one").unwrap();
-        let stored = compute_manifest(&[ent(&f1, &dir)]);
+        let stored = compute_manifest(&[ent(&f1, &dir)], None);
 
         std::fs::write(&f2, b"two").unwrap();
-        let (changed, _) = detect_change(&stored, &[ent(&f1, &dir), ent(&f2, &dir)]);
+        let (changed, _) = detect_change(&stored, &[ent(&f1, &dir), ent(&f2, &dir)], None);
         assert!(changed, "Added file must be detected");
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -629,9 +629,9 @@ mod tests {
         std::fs::write(&f, b"0123456789").unwrap();
 
         // (a) heal: stored h=0, readable now => changed
-        let mut stored = compute_manifest(&[ent(&f, &dir)]);
+        let mut stored = compute_manifest(&[ent(&f, &dir)], None);
         stored[0].h = 0;
-        let (changed, _) = detect_change(&stored, &[ent(&f, &dir)]);
+        let (changed, _) = detect_change(&stored, &[ent(&f, &dir)], None);
         assert!(changed, "stored-unknown + readable-now must HEAL (re-backup)");
 
         // (b) locked now: stored real hash (recorded BEFORE the lock), current
@@ -639,13 +639,13 @@ mod tests {
         #[cfg(target_os = "windows")]
         {
             use std::os::windows::fs::OpenOptionsExt;
-            let stored2 = compute_manifest(&[ent(&f, &dir)]); // real hash, file still readable
+            let stored2 = compute_manifest(&[ent(&f, &dir)], None); // real hash, file still readable
             assert_ne!(stored2[0].h, 0, "precondition: stored hash must be real");
             let _guard = std::fs::OpenOptions::new()
                 .read(true).share_mode(0) // exclusive — nobody else can open it
                 .open(&f).expect("open exclusive");
             let current_files = vec![ent(&f, &dir)];
-            let (changed2, _) = detect_change(&stored2, &current_files);
+            let (changed2, _) = detect_change(&stored2, &current_files, None);
             assert!(!changed2, "currently-locked file (same size) must NOT loop re-backups");
         }
 
@@ -1102,11 +1102,14 @@ fn manifest_key(rel: &Path) -> String {
 
 /// Parallel content hash of all files. Reuses the rayon walker pool.
 /// Returns None per-file on read failure (locked), keeping size for fallback.
-fn compute_manifest(files: &[FileEnt]) -> Vec<FileMeta> {
+/// `progress`: optional live ticker — the content-hash pass is the LONGEST
+/// phase on big folders (2 GB ≈ 90 s) and must not be invisible.
+fn compute_manifest(files: &[FileEnt], progress: Option<&crate::synclog::Progress>) -> Vec<FileMeta> {
     files
         .par_iter()
         .map(|f| {
             let h = hash_file(&f.path).unwrap_or(0);
+            if let Some(p) = progress { p.tick_bytes(f.size.max(1)); }
             FileMeta { p: manifest_key(&f.rel), s: f.size, h }
         })
         .collect()
@@ -1147,8 +1150,8 @@ fn read_stored_manifest(sidecar: &Path) -> Option<Vec<FileMeta>> {
 /// (the "looks unchanged" path). One full parallel hash pass — the same pass
 /// whose result is REUSED as the new manifest if a backup is triggered, so the
 /// total cost is exactly one read pass per sync, never two.
-fn detect_change(stored: &[FileMeta], current_files: &[FileEnt]) -> (bool, Vec<FileMeta>) {
-    let current = compute_manifest(current_files);
+fn detect_change(stored: &[FileMeta], current_files: &[FileEnt], progress: Option<&crate::synclog::Progress>) -> (bool, Vec<FileMeta>) {
+    let current = compute_manifest(current_files, progress);
     if stored.len() != current.len() { return (true, current); }
     let map: std::collections::HashMap<&str, &FileMeta> =
         stored.iter().map(|m| (m.p.as_str(), m)).collect();
@@ -1369,7 +1372,14 @@ pub fn sync_pair_to_cloud(source: &str, excluded: &[String], max_versions: i32, 
         match read_stored_manifest(&sidecar) {
             None => true,
             Some(stored) => {
-                let (changed, m) = detect_change(&stored, &walked.0);
+                // HASH-PROGRESS: hashing a 2 GB folder takes ~90 s — show it live.
+                let hp = crate::synclog::Progress::new(&format!("Checking {}", leaf));
+                hp.set_phase(0);
+                hp.set_totals(current_count.max(1), current_size.max(1));
+                let hw = hp.spawn_writer();
+                let (changed, m) = detect_change(&stored, &walked.0, Some(&hp));
+                hp.finish(4); // hashing done — compress_folder takes over the display
+                let _ = hw.join();
                 if changed { manifest = Some(m); }
                 changed
             }
@@ -1388,7 +1398,16 @@ pub fn sync_pair_to_cloud(source: &str, excluded: &[String], max_versions: i32, 
 
         // Rule 3 (consistency): manifest reflects files that WERE archived.
         // Computed ONCE (possibly reused from detection), before compress consumes `walked`.
-        let mut m = manifest.unwrap_or_else(|| compute_manifest(&walked.0));
+        let mut m = manifest.unwrap_or_else(|| {
+            let hp = crate::synclog::Progress::new(&format!("Checking {}", leaf));
+            hp.set_phase(0);
+            hp.set_totals(current_count.max(1), current_size.max(1));
+            let hw = hp.spawn_writer();
+            let m = compute_manifest(&walked.0, Some(&hp));
+            hp.finish(4);
+            let _ = hw.join();
+            m
+        });
 
         // Compress source to temp, then move (atomic-ish)
         // PID-unique temp name prevents corruption if two processes ever collide

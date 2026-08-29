@@ -133,9 +133,14 @@ pub fn get_health() -> HealthResult {
                         reason: String::new(),
                     };
                 }
+                // BUG-A fix: "N folders protected" must count the CONFIG's
+                // junctions (live truth), never the last sync's per-pair result —
+                // manual operations wrote ok=1 and lied "1 folder protected"
+                // until the next full cycle.
+                let count = crate::config::load_config().junctions.len().max(s.ok as usize);
                 return HealthResult {
                     status: "GREEN".into(),
-                    label: format!("✔ {} {} protected • {}", s.ok, if s.ok == 1 { "folder" } else { "folders" }, friendly_time(&s.last_sync)).into(),
+                    label: format!("✔ {} {} protected • {}", count, if count == 1 { "folder" } else { "folders" }, friendly_time(&s.last_sync)).into(),
                     reason: String::new(),
                 };
             }
