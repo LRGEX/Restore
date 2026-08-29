@@ -1,5 +1,15 @@
 # Patch Notes — LRGEX Restore
 
+## v1.5.2 — Transparency fix + non-blocking updates
+
+### Fixed the "window goes transparent" bug
+- Upgraded the UI renderer (Slint 1.10 → 1.17) — includes upstream fixes for windows rendering see-through after sleep/display changes
+- Visually verified at runtime on Windows
+
+### Updates never freeze the app again
+- The entire update flow (download → verify → install) now runs on a background thread — a slow or stalled network can no longer freeze the window "(Not Responding)"
+- New `update.log`: every update attempt logs each step (fetch, signature, download speed, hash, install) — future "nothing happened" reports are diagnosable in seconds
+
 ## v1.5.1 — Saved Games backup fix (known-folder-root bug)
 
 ### Fixed

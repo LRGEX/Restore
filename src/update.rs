@@ -33,13 +33,31 @@ struct Platform {
     signature: Option<String>,
 }
 
+/// Append-only update log — every step of every update attempt, so a
+/// "nothing happened" report is diagnosable instead of a guessing game.
+fn update_log(step: &str) {
+    use std::io::Write;
+    let path = crate::config::data_dir().join("update.log");
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+        let _ = writeln!(f, "{} {}", crate::synclog::timestamp(), step);
+    }
+}
+
 pub fn check_for_updates() {
+    // UI-thread freeze fix: the ENTIRE flow (manifest fetch, download, verify,
+    // install) runs on a worker thread. The old design downloaded on the UI
+    // thread — any network stall froze the window "(Not Responding)" for up
+    // to 2 minutes, looking like a hang. rfd dialogs are thread-safe on Windows.
+    std::thread::spawn(do_update_check);
+}
+
+fn do_update_check() {
     let current = env!("CARGO_PKG_VERSION");
     let exe_path = std::env::current_exe().unwrap_or_default();
 
     let response = match ureq::get(MANIFEST_URL).timeout(std::time::Duration::from_secs(10)).call() {
         Ok(r) => r,
-        Err(_) => return,
+        Err(e) => { update_log(&format!("manifest fetch FAILED: {}", e)); return; }
     };
 
     let manifest: Manifest = match response.into_json() {
@@ -60,6 +78,7 @@ pub fn check_for_updates() {
     let (msig, exe_sha) = match (&manifest.manifest_signature, &manifest.platforms.windows.exe_sha256) {
         (Some(m), Some(s)) if !m.is_empty() && !s.is_empty() => (m.clone(), s.clone()),
         _ => {
+            update_log("rejected: manifest has no manifest_signature (unsigned)");
             crate::synclog::write("[UPDATE] rejected unsigned manifest (no manifest_signature)");
             return;
         }
@@ -67,10 +86,12 @@ pub fn check_for_updates() {
     {
         let canonical = format!("{}|{}|{}", manifest.version, manifest.platforms.windows.url, exe_sha);
         if verify_signature(canonical.as_bytes(), &msig).is_err() {
+            update_log("rejected: manifest signature verification failed");
             crate::synclog::write("[UPDATE] rejected manifest: signature verification failed");
             return;
         }
     }
+    update_log(&format!("manifest OK: server v{} (this client v{})", manifest.version, current));
 
     if !is_newer(&manifest.version, current) {
         return;
@@ -86,8 +107,10 @@ pub fn check_for_updates() {
         .show();
 
     if confirm != rfd::MessageDialogResult::Yes {
+        update_log("user declined update");
         return;
     }
+    update_log("user accepted — starting download");
 
     // H1: unpredictable temp name — a predictable name lets same-user malware
     // pre-place/swap a payload at a known path between verify and copy.
@@ -99,8 +122,9 @@ pub fn check_for_updates() {
         .timeout(std::time::Duration::from_secs(120))
         .call() {
         Ok(r) => r,
-        Err(e) => { show_error(&format!("Download failed: {}", e)); return; }
+        Err(e) => { update_log(&format!("download FAILED: {}", e)); show_error(&format!("Download failed: {}", e)); return; }
     };
+    let dl_start = std::time::Instant::now();
 
     let mut reader = resp.into_reader();
     let mut data = Vec::new();
@@ -121,6 +145,7 @@ pub fn check_for_updates() {
         data.extend_from_slice(&chunk[..n]);
         remaining -= n;
     }
+    update_log(&format!("downloaded {} bytes in {:?}", data.len(), dl_start.elapsed()));
 
     if data.len() < 1_000_000 {
         show_error(&format!("Downloaded file too small: {} bytes.", data.len()));
@@ -192,6 +217,7 @@ pub fn check_for_updates() {
     };
     let t = temp_exe.to_string_lossy().to_string();
     let e = exe_path.to_string_lossy().to_string();
+    update_log("verified: sha256 + ed25519 + on-disk re-verify all passed");
     let h = &expected_sha256;
     // H1: the bat verifies the SHA-256 (certutil, in-box) right before copying —
     // even if the temp file is swapped during the dialog window, the copy aborts.
@@ -224,10 +250,12 @@ pub fn check_for_updates() {
     // L-6b: bat write failure must abort — spawning cmd on a nonexistent file
     // silently produced a zombie no-update.
     if std::fs::write(&bat_path, bat).is_err() {
+        update_log("FAILED: could not write updater bat");
         show_error("Could not write updater script. Update aborted.");
         let _ = std::fs::remove_file(&temp_exe);
         return;
     }
+    update_log("bat written — showing restart dialog, spawning updater");
 
     rfd::MessageDialog::new()
         .set_title("Updating")
