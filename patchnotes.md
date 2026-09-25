@@ -1,5 +1,17 @@
 # Patch Notes — LRGEX Restore
 
+## v1.6.1 — Self-healing syncs + orphan cleanup
+
+### Self-healing
+- If the last sync was interrupted (PC slept / shutdown mid-backup), the app quietly resumes it in the background on next launch — most users will never see an error
+- If auto-resume also fails, the banner becomes honest: "Sync interrupted at 09:05 (Checking .pi) — auto-resume failed" — no more scary vague "stopped unexpectedly"
+- One auto-heal attempt per launch — a machine that kills every sync won't retry forever
+
+### Duplicate backup folder cleanup
+- Failed layout migrations (OneDrive folder locks) no longer leave duplicate `folder/` + `folder_hash/` backup pairs eating cloud space — superseded folders are cleaned automatically, with retries until OneDrive releases them
+- Migration failures are now logged (never silent) and retried
+- Safety gates: cleanup only runs when the live backup is complete (archive + marker), the orphan is provably ours, and no other protected folder shares the name
+
 ## v1.6.0 — Find Game Saves + smarter game detection
 
 ### New: Tools → Find Game Saves

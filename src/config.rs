@@ -329,6 +329,24 @@ pub fn pair_key(source: &str) -> String {
 /// their old <leaf>.* names — the new code expects <key>.*). Idempotent — a
 /// no-op once migrated. Runs from sync AND restore paths (fresh reinstall may
 /// only ever run restore, so both entry points must migrate).
+/// v1.6.1: >1 configured pair sharing a leaf name makes the leaf dir
+/// AMBIGUOUS — migration/cleanup must not touch it (could be another pair's
+/// only backup). Returns true when the leaf is exclusively this source's.
+fn leaf_is_unique(source: &str, leaf: &str) -> bool {
+    let cfg = load_config();
+    let same = cfg.junctions.iter()
+        .filter(|j| Path::new(&j.source_path).file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .as_deref() == Some(leaf))
+        .count();
+    let unique = same <= 1;
+    if !unique {
+        crate::synclog::write(&format!(
+            "  [MIGRATE-SKIP] leaf '{}' is shared by {} pairs — leaving legacy dir untouched", leaf, same));
+    }
+    unique
+}
+
 pub fn migrate_pair_key(source: &str) {
     let leaf = match Path::new(source).file_name() {
         Some(n) => n.to_string_lossy().to_string(),
@@ -336,24 +354,73 @@ pub fn migrate_pair_key(source: &str) {
     };
     let key = pair_key(source);
     if key == leaf { return; }
+    if !leaf_is_unique(source, &leaf) { return; } // ambiguous — never touch
     let old_dir = script_dir().join("backup").join(&leaf);
     let new_dir = script_dir().join("backup").join(&key);
     if old_dir.is_dir() && !new_dir.exists() {
-        if std::fs::rename(&old_dir, &new_dir).is_ok() {
-            // Rename files inside: <leaf>.tar.zst -> <key>.tar.zst, same for .size
-            let old_arch = new_dir.join(format!("{}.tar.zst", leaf));
-            let new_arch = new_dir.join(format!("{}.tar.zst", key));
-            if old_arch.exists() { let _ = std::fs::rename(&old_arch, &new_arch); }
-            let old_side = new_dir.join(format!("{}.tar.zst.size", leaf));
-            let new_side = new_dir.join(format!("{}.tar.zst.size", key));
-            if old_side.exists() { let _ = std::fs::rename(&old_side, &new_side); }
+        match std::fs::rename(&old_dir, &new_dir) {
+            Ok(()) => {
+                // Rename files inside: <leaf>.tar.zst -> <key>.tar.zst, same for .size
+                let old_arch = new_dir.join(format!("{}.tar.zst", leaf));
+                let new_arch = new_dir.join(format!("{}.tar.zst", key));
+                if old_arch.exists() { let _ = std::fs::rename(&old_arch, &new_arch); }
+                let old_side = new_dir.join(format!("{}.tar.zst.size", leaf));
+                let new_side = new_dir.join(format!("{}.tar.zst.size", key));
+                if old_side.exists() { let _ = std::fs::rename(&old_side, &new_side); }
+            }
+            Err(e) => {
+                // v1.6.1: NEVER silent — a failed migration is retried on every
+                // sync until OneDrive releases the folder.
+                crate::synclog::write(&format!(
+                    "  [MIGRATE-RETRY] rename {} -> {} failed ({}): will retry next sync",
+                    leaf, key, e));
+            }
         }
     }
     // Same for versions
     let old_v = trash_base().join(&leaf);
     let new_v = trash_base().join(&key);
     if old_v.is_dir() && !new_v.exists() {
-        let _ = std::fs::rename(&old_v, &new_v);
+        if let Err(e) = std::fs::rename(&old_v, &new_v) {
+            crate::synclog::write(&format!(
+                "  [MIGRATE-RETRY] versions rename {} failed ({}): will retry next sync", leaf, e));
+        }
+    }
+}
+
+/// v1.6.1 ORPHAN CLEANUP: when a migration rename failed (OneDrive lock), the
+/// sync created the keyed folder and the old leaf dir was abandoned forever —
+/// duplicate backups eating cloud space. This removes the superseded leaf dir
+/// when (and only when) the live keyed twin exists AND the leaf dir looks like
+/// OUR backup (contains <leaf>.tar.zst) — never touches unknown/user folders.
+/// Idempotent + retried every sync until it succeeds.
+pub fn cleanup_pair_orphan(source: &str) {
+    let leaf = match Path::new(source).file_name() {
+        Some(n) => n.to_string_lossy().to_string(),
+        None => return,
+    };
+    let key = pair_key(source);
+    if key == leaf { return; }
+    if !leaf_is_unique(source, &leaf) { return; } // ambiguous — never delete
+    // Safety gate: the keyed twin must hold a COMPLETE backup (archive + sidecar
+    // marker) — a partial keyed dir must never justify deleting the leaf copy.
+    let keyed_dir = script_dir().join("backup").join(&key);
+    let live = keyed_dir.join(format!("{}.tar.zst", key)).exists()
+        && keyed_dir.join(format!("{}.tar.zst.size", key)).exists();
+    if !live { return; }
+    let orphan = script_dir().join("backup").join(&leaf);
+    if orphan.is_dir() {
+        // Safety: only delete what is provably ours
+        let is_ours = orphan.join(format!("{}.tar.zst", leaf)).exists()
+            || orphan.join(format!("{}.tar.zst.size", leaf)).exists();
+        if is_ours {
+            match std::fs::remove_dir_all(&orphan) {
+                Ok(()) => crate::synclog::write(&format!(
+                    "  [CLEANUP] removed superseded backup folder '{}' (live: {})", leaf, key)),
+                Err(e) => crate::synclog::write(&format!(
+                    "  [CLEANUP-RETRY] removing old '{}' failed ({}): will retry next sync", leaf, e)),
+            }
+        }
     }
 }
 

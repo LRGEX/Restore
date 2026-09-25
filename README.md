@@ -5,7 +5,7 @@
 # LRGEX Restore
 Your Windows folders. Remembered.
 
-**Version 1.6.0**
+**Version 1.6.1**
 
 **Automatic folder backup, versioning, and restore after a Windows reinstall.**
 

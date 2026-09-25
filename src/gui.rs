@@ -1704,6 +1704,8 @@ Failed: {}", failures.join(", ")));
     {
         let w = app.as_weak();
         let cache = health_cache.clone();
+        // v1.6.1 self-heal state: (heal_tried, heal_running) — one attempt per launch.
+        let heal_state = std::sync::Arc::new(std::sync::Mutex::new((false, false)));
         let cfg_path = config::config_path();
         let mut last_folder_count: Option<usize> = None;
         let mut spin: usize = 0;
@@ -1728,10 +1730,53 @@ Failed: {}", failures.join(", ")));
             match synclog::read_status() {
                 Some(s) if s.phase < 3 => {
                     // Liveness: heartbeat stale AND pid gone => the sync process died.
+                    // v1.6.1 SELF-HEAL: escalate, don't panic —
+                    //   1st detection: quiet background resync, amber "Resuming…"
+                    //   heal finished AND still dead: honest red with time+phase.
+                    // One heal per app launch — a machine killing every sync
+                    // must not loop retries forever.
                     let now = std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
                     if now.saturating_sub(s.heartbeat) > 15 && !synclog::is_pid_alive(s.pid) {
-                        a.set_health_text(" Sync stopped unexpectedly ".into());
+                        let heal_state = heal_state.clone();
+                        let w_heal = w.clone();
+                        use chrono::TimeZone;
+                        let interrupted_at = chrono::Local
+                            .timestamp_opt(s.heartbeat as i64, 0)
+                            .single()
+                            .map(|t| t.format("%H:%M").to_string())
+                            .unwrap_or_else(|| "?".into());
+                        let label = s.label.clone();
+                        let (tried, running) = {
+                            let mut st = heal_state.lock().unwrap();
+                            (st.0, st.1)
+                        };
+                        if !tried && !running {
+                            // KICK OFF the self-heal: full resync (sync_all_pairs
+                            // writes fresh status on completion → banner clears).
+                            let hs = heal_state.clone();
+                            {
+                                let mut st = hs.lock().unwrap();
+                                st.0 = true; st.1 = true;
+                            }
+                            std::thread::spawn(move || {
+                                crate::synclog::write("[SELF-HEAL] resuming interrupted sync");
+                                crate::sync::sync_all_pairs();
+                                let mut st = hs.lock().unwrap();
+                                st.1 = false; // heal finished (success or not)
+                            });
+                            a.set_health_text(" Resuming interrupted sync… ".into());
+                            a.set_health_color(slint::Color::from_rgb_u8(200, 140, 0));
+                            return;
+                        }
+                        if running {
+                            // Heal in flight — calm amber until it finishes.
+                            a.set_health_text(" Resuming interrupted sync… ".into());
+                            a.set_health_color(slint::Color::from_rgb_u8(200, 140, 0));
+                            return;
+                        }
+                        // Heal already ran and the status is STILL dead → real problem.
+                        a.set_health_text(format!(" Sync interrupted at {} ({}) — auto-resume failed. Run a backup or check the log. ", interrupted_at, label).into());
                         a.set_health_color(slint::Color::from_rgb_u8(200, 30, 30));
                         return;
                     }

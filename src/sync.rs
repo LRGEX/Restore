@@ -1261,6 +1261,8 @@ pub fn sync_pair_to_cloud(source: &str, excluded: &[String], max_versions: i32, 
 
     // C2: one-time migration — rename old leaf-only dirs to keyed dirs (no-op if already keyed)
     config::migrate_pair_key(source);
+    // v1.6.1: remove superseded leaf twins left behind by failed migrations
+    config::cleanup_pair_orphan(source);
 
     // Migration: old root-level backup → delete (will re-compress to backup/ on next sync)
     // L-4: only when the app's OWN sidecar marker also exists — a lone
