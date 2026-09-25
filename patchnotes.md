@@ -1,5 +1,23 @@
 # Patch Notes — LRGEX Restore
 
+## v1.6.0 — Find Game Saves + smarter game detection
+
+### New: Tools → Find Game Saves
+- One button scans the known save neighborhoods of your PC: Windows Saved Games, Documents\My Games, WB Games, Steam (all libraries, incl. extra drives), and Microsoft Store game saves
+- Shows every found location with the reason it was flagged — you confirm before anything is added
+- Numeric-ID save paths (Steam IDs) are protected at the level that keeps save-ID migration working after a reinstall
+- For game installs, only the save subfolder is offered — never the game itself
+- Folders overlapping existing protected folders are skipped
+
+### Game detection (the lamp) now uses path-shape recognition
+- Recognizes save layouts the old check missed: direct SaveData/Saves folders (BmGame\SaveData), Documents My Games, WB Games layouts, and leaf folders inside save trees (…\SaveData\backup)
+- Case-insensitive, works at any protection depth
+
+## v1.5.3 — Live progress during change detection + honest folder count
+
+- The content-hash check phase (up to ~90s on a 2 GB folder) now shows live progress: percent, MB/s, ETA — no more dead status bar
+- "N folders protected" now counts your actual protected folders from the config — manual operations no longer overwrite it with "1 folder protected"
+
 ## v1.5.2 — Transparency fix + non-blocking updates
 
 ### Fixed the "window goes transparent" bug

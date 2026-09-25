@@ -6,6 +6,7 @@ mod synclog;
 mod health;
 mod gui;
 mod update;
+mod gamescan;
 
 fn main() {
     // Crash logger: write to sync.log (no separate file)

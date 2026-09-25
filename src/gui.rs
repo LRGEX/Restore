@@ -82,6 +82,7 @@ slint::slint! {
         callback uninstall-clicked();
         callback versions-clicked(int);
         callback restore-version();
+        callback find-games-clicked();
         callback preview-version();
         callback close-versions();
         callback input-ok();
@@ -357,6 +358,10 @@ slint::slint! {
                     MenuItem {
                         label: "Set Sync Interval...";
                         clicked => { root.interval-clicked(); root.menu-open = false; }
+                    }
+                    MenuItem {
+                        label: "Find Game Saves...";
+                        clicked => { root.find-games-clicked(); root.menu-open = false; }
                     }
                     MenuItem {
                         label: "Set Max Versions...";
@@ -1281,6 +1286,69 @@ Failed: {}", failures.join(", ")));
         });
     }
 
+    // --- Find Game Saves (v1.6.0) ---
+    {
+        let w = app.as_weak();
+        app.on_find_games_clicked(move || {
+            let w = w.clone();
+            std::thread::spawn(move || {
+                // Scan on a worker thread — bounded, read-only.
+                let existing: Vec<String> = config::load_config()
+                    .junctions.iter().map(|j| j.source_path.clone()).collect();
+                let found = crate::gamescan::find_game_saves(&existing);
+                if found.is_empty() {
+                    rfd::MessageDialog::new()
+                        .set_title("Find Game Saves")
+                        .set_description("No new game save locations found.\n\n(Scanned: Saved Games, Documents\\My Games, WB Games, Steam, Microsoft Store games. Folders already protected are skipped.)")
+                        .set_buttons(rfd::MessageButtons::Ok)
+                        .show();
+                    return;
+                }
+                let mut list = String::new();
+                for f in &found {
+                    list.push_str(&format!("\n  • {}  ({})", f.protect.display(), f.reason));
+                }
+                let add = rfd::MessageDialog::new()
+                    .set_title("Find Game Saves")
+                    .set_description(&format!("Found {} save location(s):{}\n\nAdd them to LRGEX Restore?", found.len(), list))
+                    .set_buttons(rfd::MessageButtons::YesNo)
+                    .show() == rfd::MessageDialogResult::Yes;
+                if !add { return; }
+
+                // Add + immediately back up each (force), with live progress.
+                for f in &found {
+                    let p = f.protect.to_string_lossy().to_string();
+                    let leaf = f.protect.file_name()
+                        .map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+                    let mut cfg = config::load_config();
+                    if cfg.junctions.iter().any(|j| config::same_path(&j.source_path, &p)) {
+                        continue; // already protected (race-safe re-check)
+                    }
+                    cfg.junctions.push(config::Junction {
+                        source_path: p.clone(),
+                        auto_restore: true,
+                        created: crate::synclog::timestamp(),
+                        is_game: true, // discovered AS a game — lamp always green
+                    });
+                    if !config::save_config(&cfg) {
+                        rfd::MessageDialog::new()
+                            .set_title("Error")
+                            .set_description(&format!("Could not save the config — '{}' was NOT added.", leaf))
+                            .set_buttons(rfd::MessageButtons::Ok)
+                            .show();
+                        continue;
+                    }
+                    crate::synclog::write_progress(&format!("Compressing {}...", leaf));
+                    let (ok, _msg) = crate::sync::sync_pair_to_cloud(
+                        &p, &cfg.excluded_names, cfg.max_versions, true);
+                    crate::synclog::write_progress("");
+                    if ok { crate::health::write_status(1, 0, 0, &[]); }
+                }
+                let _ = w.upgrade_in_event_loop(|a| { refresh_folders(&a); });
+            });
+        });
+    }
+
     // --- Set Sync Interval ---
     {
         let w = app.as_weak();
@@ -1927,7 +1995,10 @@ fn refresh_folders(app: &App) {
         let is_game = if j.is_game {
             true
         } else {
-            let detected = crate::sync::is_game_folder(&j.source_path);
+            // v1.6.0: path-shape classifier first (case-insensitive, catches leaf
+            // and non-Steam layouts like BmGame\SaveData), tree-scan as fallback.
+            let detected = crate::gamescan::is_game_path(&j.source_path)
+                || crate::sync::is_game_folder(&j.source_path);
             if detected {
                 j.is_game = true; // Cache: persist so future launches skip scan
                 cfg_changed = true;

@@ -1873,6 +1873,11 @@ fn should_skip(name: &str) -> bool {
     SKIP_DIRS.iter().any(|s| *s == lower)
 }
 
+/// Public wrapper for other modules (gamescan discovery).
+pub fn should_skip_pub(name: &str) -> bool {
+    should_skip(name)
+}
+
 /// Marker file: set after restore so syncs know to check for new game ID folders.
 /// Auto-expires after 7 days. Cleared after successful migration.
 pub fn set_migration_pending() {
