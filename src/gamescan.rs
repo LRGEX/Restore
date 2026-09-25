@@ -180,12 +180,13 @@ pub fn find_game_saves(existing: &[String]) -> Vec<FoundSave> {
             for g in games.flatten() {
                 if !g.path().is_dir() { continue; }
                 let name = g.file_name().to_string_lossy().to_string();
-                if steam_cloud_active(&steam_root, lib, &name) {
-                    continue; // Steam already syncs this game's saves — skip
-                }
                 // look for save-shaped subdirs (BMGame/SaveData etc.) — bounded depth
                 if let Some(save_dir) = find_save_subdir(&g.path()) {
-                    push(save_dir, "game install folder (save data only)", &mut out);
+                    // Only NOW check cloud (cheaper: manifest reads only for
+                    // save-shaped games, not every installed game).
+                    if !steam_cloud_active(&steam_root, lib, &name) {
+                        push(save_dir, "game install folder (save data only)", &mut out);
+                    } // else: Steam already syncs this game's saves — skip
                 }
             }
         }
@@ -257,7 +258,13 @@ fn steam_cloud_active(steam_root: &Path, lib: &Path, game_dir_name: &str) -> boo
         if let Ok(text) = std::fs::read_to_string(m.path()) {
             let has_dir = text.lines().any(|l| {
                 let l = l.trim();
-                l.starts_with("\"installdir\"") && l.to_lowercase().contains(&game_dir_name.to_lowercase())
+                if !l.starts_with("\"installdir\"") { return false; }
+                // EXACT quoted value match (case-insensitive) — substring
+                // matching would let "Portal" match "Portal Stories Mel".
+                let val = l.split("installdir\"").nth(1)
+                    .map(|s| s.trim().trim_matches('"').to_lowercase())
+                    .unwrap_or_default();
+                !val.is_empty() && val == game_dir_name.to_lowercase()
             });
             if has_dir {
                 if let Some(a) = text.lines().find(|l| l.trim().starts_with("\"appid\"")) {
