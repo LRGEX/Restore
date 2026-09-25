@@ -168,11 +168,21 @@ pub fn find_game_saves(existing: &[String]) -> Vec<FoundSave> {
     // 4. Steam: registry SteamPath + libraryfolders.vdf → game installs ONLY.
     //    v1.6.2: userdata (official Steam Cloud) is deliberately EXCLUDED —
     //    Steam syncs those itself; backing them up is redundant.
-    for lib in steam_libraries() {
+    //    v1.6.2b: ALSO skip install-dir saves for games with ACTIVE Steam Cloud
+    //    (Auto-Cloud games like KSP sync their install-dir saves through Steam).
+    //    Detection is pure local truth: appmanifest → appid, then Steam root's
+    //    userdata/<id>/<appid>/ shows a sync record (remotecache.vdf or remote/).
+    let libs = steam_libraries();
+    let steam_root = libs.first().cloned().unwrap_or_default();
+    for lib in &libs {
         let common = lib.join("steamapps").join("common");
         if let Ok(games) = std::fs::read_dir(&common) {
             for g in games.flatten() {
                 if !g.path().is_dir() { continue; }
+                let name = g.file_name().to_string_lossy().to_string();
+                if steam_cloud_active(&steam_root, lib, &name) {
+                    continue; // Steam already syncs this game's saves — skip
+                }
                 // look for save-shaped subdirs (BMGame/SaveData etc.) — bounded depth
                 if let Some(save_dir) = find_save_subdir(&g.path()) {
                     push(save_dir, "game install folder (save data only)", &mut out);
@@ -231,6 +241,47 @@ fn steam_libraries() -> Vec<PathBuf> {
 }
 
 /// Inside a game install dir, find a save-shaped SUBDIRECTORY (never the install).
+/// True when the game ACTIVELY uses Steam Cloud: its appid shows a sync
+/// record (remotecache.vdf — Auto-Cloud games like KSP — or a non-empty
+/// remote/ — Remote Storage API games) under the Steam ROOT's userdata.
+/// Note: userdata lives only at the registry SteamPath, never in extra
+/// libraries — the appid comes from the library's appmanifest_<appid>.acf.
+fn steam_cloud_active(steam_root: &Path, lib: &Path, game_dir_name: &str) -> bool {
+    if steam_root.as_os_str().is_empty() { return false; }
+    // 1. Find the appid whose installdir matches this game folder
+    let manifests = match std::fs::read_dir(lib.join("steamapps")) { Ok(e) => e, Err(_) => return false };
+    let mut appid = String::new();
+    for m in manifests.flatten() {
+        let fname = m.file_name().to_string_lossy().to_string();
+        if !(fname.starts_with("appmanifest_") && fname.ends_with(".acf")) { continue; }
+        if let Ok(text) = std::fs::read_to_string(m.path()) {
+            let has_dir = text.lines().any(|l| {
+                let l = l.trim();
+                l.starts_with("\"installdir\"") && l.to_lowercase().contains(&game_dir_name.to_lowercase())
+            });
+            if has_dir {
+                if let Some(a) = text.lines().find(|l| l.trim().starts_with("\"appid\"")) {
+                    appid = a.trim().trim_matches(['\t', ' '])
+                        .replace("\"appid\"", "").trim().trim_matches('"').to_string();
+                    break;
+                }
+            }
+        }
+    }
+    if appid.is_empty() { return false; }
+    // 2. Sync record under the Steam root's userdata (any user id)
+    let userdata = steam_root.join("userdata");
+    if let Ok(users) = std::fs::read_dir(&userdata) {
+        for u in users.flatten() {
+            let rec = u.path().join(&appid);
+            if rec.join("remotecache.vdf").is_file() { return true; } // Auto-Cloud
+            let remote = rec.join("remote");
+            if remote.is_dir() && dir_nonempty(&remote) { return true; } // Remote Storage
+        }
+    }
+    false
+}
+
 fn find_save_subdir(game_dir: &Path) -> Option<PathBuf> {
     let mut visited = 0usize;
     find_save_subdir_inner(game_dir, 0, &mut visited)
