@@ -2427,20 +2427,3 @@ fn copy_dir_merge(source: &Path, target: &Path) {
     }
 }
 
-#[cfg(test)]
-mod restore_debug_tests {
-    use super::*;
-    #[test]
-    fn debug_healtest_restore() {
-        let archive = std::path::PathBuf::from(r"C:\Users\lrg4you\OneDrive\Documents\LRGEX-saves\backup\Saves_19b43f34\Saves_19b43f34.tar.zst");
-        if !archive.exists() { eprintln!("skip: archive missing"); return; }
-        let dest = std::path::PathBuf::from(r"X:\LRGEX-HealTest\restore_debug_out");
-        let _ = std::fs::remove_dir_all(&dest);
-        let _ = std::fs::create_dir_all(&dest);
-        let (ok, msg) = decompress_archive(&archive, &dest);
-        eprintln!("RESULT ok={} msg={:?}", ok, msg);
-        if let Ok(es) = std::fs::read_dir(&dest) {
-            for e in es.flatten() { eprintln!("  extracted: {}", e.path().display()); }
-        }
-    }
-}
