@@ -77,7 +77,7 @@ fn main() {
         let mut cfg = config::load_config();
         // L2: normalized dedup — see config::same_path (contracted vs expanded aware)
         cfg.junctions.retain(|j| !config::same_path(&j.source_path, &link_path));
-        cfg.junctions.push(config::Junction { source_path: link_path.clone(), auto_restore: true, created: synclog::timestamp(), is_game: false });
+        cfg.junctions.push(config::Junction { source_path: link_path.clone(), auto_restore: true, created: synclog::timestamp(), is_game: false, volume_id: None });
         if !config::save_config(&cfg) {
             rfd::MessageDialog::new()
                 .set_title("Error")

@@ -171,7 +171,13 @@ pub struct FileEnt {
     pub path: PathBuf,
     pub rel: PathBuf,
     pub size: u64,
+    /// Real modification time, clamped to FAT32's floor (1980-01-01) so
+    /// restores onto FAT32/SD cards can set it. 0 = unknown (legacy walk).
+    pub mtime: u64,
 }
+
+/// FAT32 cannot represent times before 1980-01-01 UTC.
+const FAT32_EPOCH: u64 = 315532800;
 
 /// SINGLE WALK — replaces compute_stats + collect_files.
 /// Returns (entries, total_bytes, count). Uses DirEntry::metadata() which on
@@ -216,10 +222,14 @@ pub fn walk_tree(base: &Path, excluded: &[String]) -> Option<(Vec<FileEnt>, u64,
             if ft.is_dir() {
                 subdirs.push(path);
             } else {
-                let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
+                let meta = entry.metadata();
+                let size = meta.as_ref().map(|m| m.len()).unwrap_or(0);
+                let mtime = meta.as_ref().ok().and_then(|m| m.modified().ok())
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|d| d.as_secs()).unwrap_or(0);
                 total += size;
                 let rel = path.strip_prefix(base).unwrap_or(&path).to_path_buf();
-                out.push(FileEnt { path, rel, size });
+                out.push(FileEnt { path, rel, size, mtime });
             }
         }
         for d in subdirs.into_iter().rev() {
@@ -260,23 +270,31 @@ fn walk_inner(base: &Path, current: &Path, excluded: &[String], out: &mut Vec<Fi
         if ft.is_dir() {
             walk_inner(base, &path, excluded, out, total, failed);
         } else {
-            let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
+            let meta = entry.metadata();
+            let size = meta.as_ref().map(|m| m.len()).unwrap_or(0);
+            let mtime = meta.as_ref().ok().and_then(|m| m.modified().ok())
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs()).unwrap_or(0);
             *total += size;
             let rel = path.strip_prefix(base).unwrap_or(&path).to_path_buf();
-            out.push(FileEnt { path, rel, size });
+            out.push(FileEnt { path, rel, size, mtime });
         }
     }
 }
 
 /// Exact header construction for tar 0.4 (deterministic: mtime/uid/gid zeroed, 0o644).
-fn make_header(size: u64) -> tar::Header {
+fn make_header(size: u64, mtime: u64) -> tar::Header {
     let mut h = tar::Header::new_gnu();
     h.set_entry_type(tar::EntryType::Regular);
     h.set_size(size);
     h.set_mode(0o644);
     h.set_uid(0);
     h.set_gid(0);
-    h.set_mtime(0);
+    // REAL mtime (clamped ≥ FAT32 floor) — preserves the user's actual file
+    // dates through backup→format→restore. Games/save-managers that sort by
+    // date keep working. mtime=0 entries (legacy archives) are fine: restore
+    // falls back to no-mtime on failure.
+    h.set_mtime(mtime.max(FAT32_EPOCH));
     h.set_cksum();
     h
 }
@@ -584,7 +602,53 @@ mod tests {
             path: path.to_path_buf(),
             rel: path.strip_prefix(base).unwrap().to_path_buf(),
             size: std::fs::metadata(path).map(|m| m.len()).unwrap_or(0),
+            mtime: std::fs::metadata(path).ok().and_then(|m| m.modified().ok())
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs()).unwrap_or(0),
         }
+    }
+
+    #[test]
+    fn test_mtime_preserved_roundtrip() {
+        // v1.7: backup must capture the file's REAL mtime (≥ FAT32 floor) and
+        // restore must preserve it. Guards the whole chain: walk capture →
+        // header clamp → unpack preserve.
+        use std::io::Write;
+        let dir = std::env::temp_dir().join(format!("lrgex_mtime_{}_src", tmp_tag()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("game.sav");
+        std::fs::write(&f, b"save bytes").unwrap();
+        let arch = std::env::temp_dir().join(format!("lrgex_mtime_{}.tar.zst", tmp_tag()));
+        let (ok, _) = compress_folder(&dir, &arch, &[], None);
+        assert!(ok, "backup failed");
+        // Read the archive header mtime — must be ≥ FAT32 floor (1980)
+        let raw = std::fs::read(&arch).unwrap();
+        let dec = zstd::stream::decode_all(&raw[..]).unwrap();
+        // GNU tar header: mtime at offset 136, 12 octal bytes
+        assert!(dec.len() > 148, "archive too small: {}", dec.len());
+        let mtime_digits: String = String::from_utf8_lossy(&dec[136..148])
+            .chars().take_while(|c| c.is_ascii_digit()).collect();
+        let mtime = u64::from_str_radix(&mtime_digits, 8).expect("octal mtime");
+        assert!(mtime >= 315532800, "header mtime {} below FAT32 floor", mtime);
+        assert!(mtime <= std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() + 5,
+            "header mtime {} in the future", mtime);
+        // Restore + verify preserved mtime (±2s tolerance)
+        let out = std::env::temp_dir().join(format!("lrgex_mtime_{}_out", tmp_tag()));
+        let _ = std::fs::remove_dir_all(&out);
+        std::fs::create_dir_all(&out).unwrap();
+        let (rok, rmsg) = decompress_archive(&arch, &out);
+        assert!(rok, "restore failed: {}", rmsg);
+        let restored = out.join("game.sav");
+        assert!(restored.exists());
+        let got = std::fs::metadata(&restored).unwrap().modified().unwrap()
+            .duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+        let want = std::fs::metadata(&f).unwrap().modified().unwrap()
+            .duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+        assert!(got.abs_diff(want) <= 2, "mtime not preserved: restored {} vs source {}", got, want);
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&out);
+        let _ = std::fs::remove_file(&arch);
     }
 
     #[test]
@@ -889,7 +953,7 @@ pub fn compress_folder(
         for (e, data) in batch.iter().zip(loaded.into_iter()) {
             let res: std::io::Result<()> = match data {
                 Some(Ok(buf)) => {
-                    let mut h = make_header(buf.len() as u64);
+                    let mut h = make_header(buf.len() as u64, e.mtime);
                     let mut slice: &[u8] = buf.as_slice();
                     builder.append_data(&mut h, &e.rel, &mut slice)
                 }
@@ -898,7 +962,7 @@ pub fn compress_folder(
                     match std::fs::File::open(&e.path) {
                         Ok(f) => match f.metadata() {
                             Ok(m) => {
-                                let mut h = make_header(m.len());
+                                let mut h = make_header(m.len(), e.mtime);
                                 let mut cr = ByteReader { inner: f, progress: progress.clone() };
                                 builder.append_data(&mut h, &e.rel, &mut cr)
                             }
@@ -965,6 +1029,20 @@ impl std::io::Read for CountingReader {
     }
 }
 
+/// Unpack an archive into dest with a FRESH decoder (the zstd stream is
+/// single-use). `preserve_mtime=false` for the legacy/FAT32 fallback.
+fn unpack_fresh(archive: &Path, dest: &Path, preserve_mtime: bool) -> Result<(), String> {
+    use std::io::Read;
+    let f = std::fs::File::open(archive).map_err(|e| e.to_string())?;
+    let bytes_read = Arc::new(AtomicU64::new(0));
+    let counting_file = CountingReader { inner: f, counter: bytes_read.clone() };
+    let decoder = zstd::Decoder::new(counting_file).map_err(|e| e.to_string())?;
+    let mut tar = tar::Archive::new(decoder);
+    tar.set_preserve_mtime(preserve_mtime);
+    tar.set_preserve_permissions(false);
+    tar.unpack(dest).map_err(|e| e.to_string())
+}
+
 pub fn decompress_archive(archive: &Path, dest: &Path) -> (bool, String) {
     let _ = std::fs::create_dir_all(dest);
     let temp_dir = dest.parent().unwrap_or(std::path::Path::new("."))
@@ -1002,6 +1080,9 @@ pub fn decompress_archive(archive: &Path, dest: &Path) -> (bool, String) {
         Err(e) => { let _ = std::fs::remove_dir_all(&temp_dir); return (false, format!("corrupt archive (zstd): {}", e)); }
     };
     let mut tar = tar::Archive::new(decoder);
+    // Restore REAL mtimes (new archives carry them, clamped FAT32-safe).
+    tar.set_preserve_mtime(true);
+    tar.set_preserve_permissions(false);
 
     let stop = Arc::new(AtomicBool::new(false));
     let stop_clone = stop.clone();
@@ -1019,8 +1100,27 @@ pub fn decompress_archive(archive: &Path, dest: &Path) -> (bool, String) {
         }
     });
 
-    match tar.unpack(&temp_dir) {
-        Ok(_) => {
+    let _ = &tar; // built above for the header probe
+    // Unpack with a FRESH decoder per attempt — the zstd stream is consumed
+    // by the first unpack and cannot be replayed.
+    let mut unpack_result = unpack_fresh(archive, &temp_dir, true);
+    if unpack_result.is_err() {
+        // LEGACY-ARCHIVE FALLBACK: pre-v1.7 archives carry mtime=0 (1970)
+        // which FAT32 rejects (pre-1980 impossible). Retry WITHOUT metadata —
+        // content is what matters; a failed restore is worse than lost dates.
+        crate::synclog::write("  [DECOMPRESS] retry without metadata (legacy archive / FAT32 destination)");
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        let _ = std::fs::create_dir_all(&temp_dir);
+        unpack_result = unpack_fresh(archive, &temp_dir, false);
+    }
+    if let Err(e) = unpack_result {
+        stop.store(true, Ordering::Relaxed);
+        crate::synclog::write_progress("");
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        return (false, format!("extract failed: {}", e));
+    }
+    {
+        {
             stop.store(true, Ordering::Relaxed);
             crate::synclog::write_progress("");
             let ec = std::fs::read_dir(&temp_dir).map(|d| d.count()).unwrap_or(0);
@@ -1076,12 +1176,6 @@ pub fn decompress_archive(archive: &Path, dest: &Path) -> (bool, String) {
             }
             let _ = std::fs::remove_dir_all(&backup_name);
             (true, String::new())
-        }
-        Err(e) => {
-            stop.store(true, Ordering::Relaxed);
-            crate::synclog::write_progress("");
-            let _ = std::fs::remove_dir_all(&temp_dir);
-            (false, format!("extract failed: {}", e))
         }
     }
 }
@@ -2329,6 +2423,24 @@ fn copy_dir_merge(source: &Path, target: &Path) {
                     let _ = std::fs::copy(&src_path, &tgt_path);
                 }
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod restore_debug_tests {
+    use super::*;
+    #[test]
+    fn debug_healtest_restore() {
+        let archive = std::path::PathBuf::from(r"C:\Users\lrg4you\OneDrive\Documents\LRGEX-saves\backup\Saves_19b43f34\Saves_19b43f34.tar.zst");
+        if !archive.exists() { eprintln!("skip: archive missing"); return; }
+        let dest = std::path::PathBuf::from(r"X:\LRGEX-HealTest\restore_debug_out");
+        let _ = std::fs::remove_dir_all(&dest);
+        let _ = std::fs::create_dir_all(&dest);
+        let (ok, msg) = decompress_archive(&archive, &dest);
+        eprintln!("RESULT ok={} msg={:?}", ok, msg);
+        if let Ok(es) = std::fs::read_dir(&dest) {
+            for e in es.flatten() { eprintln!("  extracted: {}", e.path().display()); }
         }
     }
 }

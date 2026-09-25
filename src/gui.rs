@@ -83,6 +83,7 @@ slint::slint! {
         callback versions-clicked(int);
         callback restore-version();
         callback find-games-clicked();
+        callback repair-paths-clicked();
         callback preview-version();
         callback close-versions();
         callback input-ok();
@@ -362,6 +363,10 @@ slint::slint! {
                     MenuItem {
                         label: "Find Game Saves...";
                         clicked => { root.find-games-clicked(); root.menu-open = false; }
+                    }
+                    MenuItem {
+                        label: "Repair Missing Folders...";
+                        clicked => { root.repair-paths-clicked(); root.menu-open = false; }
                     }
                     MenuItem {
                         label: "Set Max Versions...";
@@ -789,6 +794,7 @@ pub fn run() {
                             .show() == rfd::MessageDialogResult::Yes;
                         cfg.junctions.push(config::Junction {
                             source_path: p.clone(), auto_restore: ar, created: synclog::timestamp(), is_game: false,
+                            volume_id: None,
                         });
                         if !config::save_config(&cfg) {
                             rfd::MessageDialog::new()
@@ -860,6 +866,7 @@ pub fn run() {
                 c2.junctions.retain(|j| j.source_path != path);
                 c2.junctions.push(config::Junction {
                     source_path: path.clone(), auto_restore: ar, created: synclog::timestamp(), is_game: false,
+                    volume_id: None,
                 });
                 if !config::save_config(&c2) {
                     rfd::MessageDialog::new()
@@ -1286,6 +1293,68 @@ Failed: {}", failures.join(", ")));
         });
     }
 
+    // --- Repair Missing Folders (v1.7) — fallback when auto-heal can't find
+    // the drive (reformatted/replaced): user picks the new location, we
+    // update the junction AND re-key the backup so it follows.
+    {
+        let w = app.as_weak();
+        app.on_repair_paths_clicked(move || {
+            let a = match w.upgrade() { Some(a) => a, None => return };
+            let mut cfg = config::load_config();
+            let missing: Vec<(usize, String)> = cfg.junctions.iter().enumerate()
+                // EXPANDED form — stored paths are contracted (%USERPROFILE%\...)
+                // and would otherwise all be falsely flagged as missing.
+                .filter(|(_, j)| !std::path::Path::new(&crate::pathutil::expand(&j.source_path)).exists())
+                .map(|(i, j)| (i, j.source_path.clone()))
+                .collect();
+            if missing.is_empty() {
+                rfd::MessageDialog::new()
+                    .set_title("Repair Paths")
+                    .set_description("All protected folders are reachable — nothing to repair.")
+                    .set_buttons(rfd::MessageButtons::Ok)
+                    .show();
+                return;
+            }
+            let mut repaired = 0;
+            for (i, old_path) in missing {
+                let confirm = rfd::MessageDialog::new()
+                    .set_title("Repair Folder")
+                    .set_description(&format!(
+                        "This folder can't be found:\n{}\n\nWas its drive renamed? Pick its new location.",
+                        old_path))
+                    .set_buttons(rfd::MessageButtons::YesNo)
+                    .show() == rfd::MessageDialogResult::Yes;
+                if !confirm { continue; }
+                if let Some(new_root) = rfd::FileDialog::new()
+                    .set_title("Pick the folder's new location")
+                    .pick_folder()
+                {
+                    let new_path = new_root.to_string_lossy().to_string();
+                    if !new_path.is_empty() {
+                        crate::synclog::write(&format!(
+                            "  [REPAIR] {} -> {}", old_path, new_path));
+                        // Re-key the backup so it follows the repaired path
+                        config::rekey_backup(&old_path, &new_path);
+                        cfg.junctions[i].source_path = new_path;
+                        repaired += 1;
+                    }
+                }
+            }
+            if repaired > 0 {
+                if !config::save_config(&cfg) {
+                    rfd::MessageDialog::new().set_title("Error")
+                        .set_description("Could not save the config — repairs not saved.")
+                        .set_buttons(rfd::MessageButtons::Ok).show();
+                    return;
+                }
+                refresh_folders(&a);
+                rfd::MessageDialog::new().set_title("Repaired")
+                    .set_description(&format!("Repaired {} folder(s). Backups follow automatically.", repaired))
+                    .set_buttons(rfd::MessageButtons::Ok).show();
+            }
+        });
+    }
+
     // --- Find Game Saves (v1.6.0) ---
     {
         let w = app.as_weak();
@@ -1326,6 +1395,7 @@ Failed: {}", failures.join(", ")));
                     }
                     cfg.junctions.push(config::Junction {
                         source_path: p.clone(),
+                        volume_id: None,
                         auto_restore: true,
                         created: crate::synclog::timestamp(),
                         is_game: true, // discovered AS a game — lamp always green

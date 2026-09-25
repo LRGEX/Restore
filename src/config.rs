@@ -12,6 +12,11 @@ pub struct Junction {
     pub created: String,
     #[serde(default)]
     pub is_game: bool,
+    /// v1.7: stable volume GUID of the junction's drive ("{GUID}") — recorded
+    /// so a drive-LETTER reshuffle after a format can be healed automatically.
+    /// None in pre-v1.7 configs (legacy relative-path fallback applies).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub volume_id: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -120,6 +125,16 @@ pub fn save_config(cfg: &Config) -> bool {
     let path = config_path();
     let mut cfg = cfg.clone();
     for j in &mut cfg.junctions {
+        // v1.7: record the volume GUID from the EXPANDED path before contracting.
+        // Only overwrite on SUCCESS — a temporarily-unplugged drive must not
+        // wipe the stored GUID (it's needed exactly when the drive returns
+        // with a different letter).
+        let expanded = crate::pathutil::expand(&j.source_path);
+        if let Some(letter) = drive_letter(&expanded) {
+            if let Some(g) = volume_guid(&letter) {
+                j.volume_id = Some(g);
+            }
+        }
         j.source_path = crate::pathutil::contract(&j.source_path);
     }
     match serde_json::to_string_pretty(&cfg) {
@@ -170,6 +185,19 @@ pub fn load_config() -> Config {
                     j.source_path = healed;
                     needs_save = true;
                 }
+            }
+        }
+
+        // v1.7 DRIVE HEALING: drive letters reshuffle after a format (E:→D:).
+        // Volume GUIDs don't. Heal + re-key the backup so it follows the path.
+        {
+            let stored = j.volume_id.clone();
+            if let Some(healed) = heal_drive_letter(&j.source_path, stored.as_deref()) {
+                rekey_backup(&j.source_path, &healed);
+                crate::synclog::write(&format!(
+                    "  [HEAL-DRIVE] {} -> {}", j.source_path, healed));
+                j.source_path = healed;
+                needs_save = true;
             }
         }
     }
@@ -445,6 +473,137 @@ pub fn legacy_raw_folder(source: &str) -> Option<PathBuf> {
     if p.is_dir() { Some(p) } else { None }
 }
 
+/// Stable volume identity of a drive root — the partition's GUID survives
+/// drive-LETTER reshuffles (format C: → E: becomes D:), because the data
+/// partition itself is untouched. Returns "{GUID}" form, or None.
+#[cfg(target_os = "windows")]
+pub fn volume_guid(letter_root: &str) -> Option<String> {
+    use windows_sys::Win32::Storage::FileSystem::GetVolumeNameForVolumeMountPointW;
+    use std::os::windows::ffi::OsStrExt;
+    let root = format!("{}\\", letter_root.trim_end_matches('\\')); // API needs trailing backslash
+    let wide: Vec<u16> = std::ffi::OsStr::new(&root).encode_wide().chain(std::iter::once(0)).collect();
+    let mut buf = [0u16; 100];
+    let ok = unsafe {
+        GetVolumeNameForVolumeMountPointW(wide.as_ptr(), buf.as_mut_ptr(), buf.len() as u32)
+    };
+    if ok == 0 { return None; }
+    let s = String::from_utf16_lossy(&buf);
+    match (s.find('{'), s.find('}')) {
+        (Some(a), Some(b)) if b > a => Some(s[a..=b].to_string()),
+        _ => None,
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn volume_guid(_letter_root: &str) -> Option<String> { None }
+
+/// "E:" from "E:\anything" (drive-letter paths only).
+fn drive_letter(path: &str) -> Option<String> {
+    let b = path.as_bytes();
+    if b.len() >= 2 && b[0].is_ascii_alphabetic() && b[1] == b':' {
+        Some(path[..2].to_string())
+    } else {
+        None
+    }
+}
+
+/// Find which drive letter currently hosts the given volume GUID.
+/// `lookup` is injectable for tests.
+fn find_guid_letter(guid: &str, lookup: impl Fn(&str) -> Option<String>) -> Option<String> {
+    for l in b'A'..=b'Z' {
+        let letter = format!("{}:", l as char);
+        if lookup(&letter).as_deref() == Some(guid) {
+            return Some(letter);
+        }
+    }
+    None
+}
+
+/// v1.7 DRIVE HEALING: called from load_config for each junction with a
+/// non-system (non-contractable) absolute path. Three cases:
+///   1. Stored GUID, letter missing or reassigned → find GUID on another letter → heal + re-key.
+///   2. No stored GUID (pre-v1.7 config) + drive missing → LEGACY fallback:
+///      scan other drives for the SAME relative path — accept only if exactly one match.
+///   3. Nothing found → leave untouched, log clearly (GUI Repair tool handles it).
+fn heal_drive_letter(source: &str, stored_guid: Option<&str>) -> Option<String> {
+    let letter = drive_letter(source)?; // only drive-letter paths
+    if source.len() < 4 { return None; } // bare "E:" — nothing relative to keep
+    let rel = &source[3..]; // after "X:\"
+    let current = volume_guid(&letter);
+    let ok = match stored_guid {
+        Some(g) => current.as_deref() == Some(g), // GUID matches → healthy
+        // No stored GUID (pre-v1.7 config): only heal when the path is GONE
+        // (letter vanished or reassigned to a different disk).
+        None => std::path::Path::new(source).exists(),
+    };
+    if ok { return None; }
+
+    // Case 1: GUID hunt
+    if let Some(g) = stored_guid {
+        if let Some(new_letter) = find_guid_letter(g, volume_guid) {
+            return Some(format!("{}\\{}", new_letter, rel));
+        }
+        crate::synclog::write(&format!(
+            "  [HEAL-DRIVE-FAIL] volume {} of '{}' not found on any drive", g, source));
+        return None;
+    }
+
+    // Case 2: legacy — same relative path on exactly one OTHER drive
+    let mut hits = Vec::new();
+    for l in b'A'..=b'Z' {
+        let letter = format!("{}:", l as char);
+        if letter.eq_ignore_ascii_case(&letter_of(source)) { continue; }
+        if volume_guid(&letter).is_none() { continue; } // drive exists?
+        let candidate = format!("{}\\{}", letter, rel);
+        if std::path::Path::new(&candidate).is_dir() {
+            hits.push(candidate);
+        }
+    }
+    if hits.len() == 1 {
+        crate::synclog::write(&format!(
+            "  [HEAL-DRIVE-LEGACY] unique relative-path match: {} → {}", source, hits[0]));
+        return Some(hits[0].clone());
+    }
+    if hits.len() > 1 {
+        crate::synclog::write(&format!(
+            "  [HEAL-DRIVE-FAIL] '{}' ambiguous — matches multiple drives; use Repair Paths", source));
+    }
+    None
+}
+
+fn letter_of(path: &str) -> String {
+    drive_letter(path).unwrap_or_default()
+}
+
+/// Rename a keyed backup dir (and versions dir) from one pair key to another —
+/// shared by leaf→key migration and drive-letter re-keying. Idempotent.
+fn migrate_pair_dir(old_key: &str, new_key: &str) {
+    if old_key == new_key { return; }
+    let old_dir = script_dir().join("backup").join(old_key);
+    let new_dir = script_dir().join("backup").join(new_key);
+    if old_dir.is_dir() && !new_dir.exists() {
+        if std::fs::rename(&old_dir, &new_dir).is_ok() {
+            for (from, to) in [
+                (new_dir.join(format!("{}.tar.zst", old_key)), new_dir.join(format!("{}.tar.zst", new_key))),
+                (new_dir.join(format!("{}.tar.zst.size", old_key)), new_dir.join(format!("{}.tar.zst.size", new_key))),
+            ] {
+                if from.exists() { let _ = std::fs::rename(&from, &to); }
+            }
+        }
+    }
+    let old_v = trash_base().join(old_key);
+    let new_v = trash_base().join(new_key);
+    if old_v.is_dir() && !new_v.exists() {
+        let _ = std::fs::rename(&old_v, &new_v);
+    }
+}
+
+/// DRIVE RE-KEY: after a healed path changes its drive letter, the pair key
+/// (hash of the contracted path) changes — move the backup so it follows.
+pub fn rekey_backup(old_source: &str, new_source: &str) {
+    migrate_pair_dir(&pair_key(old_source), &pair_key(new_source));
+}
+
 pub fn trash_path_for(source: &str) -> PathBuf {
     trash_base().join(pair_key(source))
 }
@@ -527,5 +686,134 @@ mod tests {
         let c = pair_key(r"E:\Games\OtherSaves");
         assert_eq!(a, b, "same source must produce the same key");
         assert_ne!(a, c, "different sources must not collide");
+    }
+
+    #[test]
+    fn test_drive_letter_parse() {
+        assert_eq!(drive_letter(r"E:\Steam\KSP"), Some("E:".into()));
+        assert_eq!(drive_letter(r"C:\"), Some("C:".into()));
+        assert_eq!(drive_letter(r"E:"), Some("E:".into()));
+        assert_eq!(drive_letter(r"\\\\?\\Volume{X}\\path"), None);
+        assert_eq!(drive_letter("relative/path"), None);
+    }
+
+    #[test]
+    fn test_find_guid_letter_scan() {
+        let lookup = |l: &str| if l == "D:" { Some("{ABCD}".to_string()) } else { None };
+        assert_eq!(find_guid_letter("{ABCD}", &lookup), Some("D:".to_string()));
+        assert_eq!(find_guid_letter("{MISSING}", &lookup), None);
+    }
+
+    #[test]
+    #[cfg(target_os = "windows")]
+    fn test_volume_guid_c_drive() {
+        let g = volume_guid("C:");
+        assert!(g.is_some(), "C: should have a volume GUID");
+        let g = g.unwrap();
+        assert!(g.starts_with('{') && g.ends_with('}'));
+        assert_eq!(volume_guid("C:"), Some(g), "GUID must be stable across calls");
+    }
+
+    #[test]
+    fn test_drive_rekey_migration() {
+        let old_key = pair_key(r"E:\Games\TestRekey");
+        let new_key = pair_key(r"D:\Games\TestRekey");
+        assert_ne!(old_key, new_key);
+        let old_dir = script_dir().join("backup").join(&old_key);
+        let new_dir = script_dir().join("backup").join(&new_key);
+        let _ = std::fs::remove_dir_all(&old_dir);
+        let _ = std::fs::remove_dir_all(&new_dir);
+        std::fs::create_dir_all(&old_dir).unwrap();
+        std::fs::write(old_dir.join(format!("{}.tar.zst", old_key)), b"x").unwrap();
+        migrate_pair_dir(&old_key, &new_key);
+        assert!(new_dir.join(format!("{}.tar.zst", new_key)).exists(), "archive must follow the re-key");
+        assert!(!old_dir.exists());
+        let _ = std::fs::remove_dir_all(&new_dir);
+    }
+
+    #[test]
+    #[cfg(target_os = "windows")]
+    fn test_legacy_heal_no_guid() {
+        // Pre-v1.7 config (no stored GUID): dead letter + the SAME relative
+        // path on exactly one other drive → legacy fallback heals.
+        // Uses the real H: disk (same constraint as the e2e test).
+        if volume_guid("H:").is_none() { return; } // disk absent — skip
+        let dir = r"H:\LRGEX-HealTest\Saves";
+        std::fs::create_dir_all(dir).ok();
+        let healed = heal_drive_letter(r"X:\LRGEX-HealTest\Saves", None);
+        assert_eq!(healed.as_deref(), Some(dir), "legacy fallback must find the H: match");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    #[cfg(target_os = "windows")]
+    fn test_e2e_drive_heal_real_guid() {
+        // REAL end-to-end through load_config: junction on a dead letter (X:),
+        // volume_id = the REAL GUID of H: (this machine has H:), backup keyed
+        // by the old path. load_config must heal X:→H: AND re-key the backup.
+        // Donor drive: any existing non-system letter (H: may be renamed mid-session
+        // — the physical test moves it to X:!). Prefer fixed data drives.
+        // Donor: the letter that ACTUALLY hosts LRGEX-HealTest\Saves (the
+        // physical-test flash moves around — H: became X: mid-session!).
+        // Self-contained: pick any live non-system drive, CREATE the folder
+        // (no dependency on the physical-test flash, which moves/cleans up).
+        let candidates = ["E:", "F:", "D:", "T:", "H:", "X:"];
+        let donor = candidates.iter().find(|l| volume_guid(l).is_some() && *l != &"C:".to_string())
+            .copied().expect("test machine must have a second drive");
+        let sep = std::path::MAIN_SEPARATOR;
+        let live_dir = format!("{}{}lrgex_e2e_heal{}Saves", donor, sep, sep);
+        std::fs::create_dir_all(&live_dir).ok();
+        std::fs::write(std::path::Path::new(&live_dir).join("seed.sav"), b"x").ok();
+        // Dead letter: any letter with no volume at all (runtime scan).
+        let dead = (b'A'..=b'Z').map(|c| format!("{}:", c as char))
+            .find(|l| volume_guid(l).is_none() && l != &donor)
+            .expect("a free drive letter must exist");
+        let h_guid = volume_guid(donor).unwrap();
+        let sep = std::path::MAIN_SEPARATOR;
+        let old_path = format!("{}{}LRGEX-HealTest{}Saves", dead, sep, sep);
+
+        // Seed the config (test binary's script_dir)
+        let cfg_path = config_path();
+        let backup = std::fs::read_to_string(&cfg_path).unwrap_or_default();
+        let seeded = serde_json::json!({
+            "Junctions": [{
+                "SourcePath": old_path,
+                "AutoRestore": false,
+                "Created": "test",
+                "IsGame": false,
+                "VolumeId": h_guid,
+            }],
+            "SyncIntervalMinutes": 1440,
+            "MaxVersions": 2,
+            "ExcludedNames": []
+        });
+        std::fs::write(&cfg_path, seeded.to_string()).unwrap();
+
+        // Old-keyed backup dir + archive
+        let old_key = pair_key(&old_path);
+        let old_dir = script_dir().join("backup").join(&old_key);
+        let _ = std::fs::remove_dir_all(&old_dir);
+        std::fs::create_dir_all(&old_dir).unwrap();
+        std::fs::write(old_dir.join(format!("{}.tar.zst", old_key)), b"fake-archive").unwrap();
+
+        // HEAL: the exact function the app runs at every startup
+        let cfg = load_config();
+
+        let healed = cfg.junctions[0].source_path.clone();
+        assert!(healed.starts_with(&format!("{}\\", donor)), "junction must heal to {}, got: {}", donor, healed);
+        assert!(healed.ends_with("LRGEX-HealTest\\Saves"), "relative path preserved: {}", healed);
+
+        // Backup followed the re-key
+        let new_key = pair_key(&healed);
+        let new_dir = script_dir().join("backup").join(&new_key);
+        assert!(new_dir.join(format!("{}.tar.zst", new_key)).exists(),
+            "backup archive must follow the healed path");
+        assert!(!old_dir.exists(), "old-keyed dir must be gone");
+
+        // Cleanup: restore original config (if any) + test dirs
+        if backup.is_empty() { let _ = std::fs::remove_file(&cfg_path); }
+        else { let _ = std::fs::write(&cfg_path, &backup); }
+        let _ = std::fs::remove_dir_all(&new_dir);
+        let _ = std::fs::remove_dir_all(&live_dir);
     }
 }
