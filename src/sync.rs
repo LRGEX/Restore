@@ -176,20 +176,56 @@ pub struct FileEnt {
 /// SINGLE WALK — replaces compute_stats + collect_files.
 /// Returns (entries, total_bytes, count). Uses DirEntry::metadata() which on
 /// Windows is served from the directory enumeration cache (no extra syscall).
-/// M2 + H-2: walk_tree returns None when the ROOT itself is unreadable —
-/// the sync must NOT proceed (an empty archive would replace a good backup,
-/// and a later auto-restore would wipe the user's folder). Subtree failures
-/// are logged ([WALK-WARN]) and excluded, but the root gates everything.
+/// SINGLE WALK — replaces compute_stats + collect_files.
+/// Returns (entries, total_bytes, count). Uses DirEntry::metadata() which on
+/// Windows is served from the directory enumeration cache (no extra syscall).
+/// v1.6.2: ITERATIVE (explicit heap stack) — the recursive version was the
+/// prime suspect for the stack-overflow crashes; this shape physically cannot
+/// overflow, at any directory depth, on any thread's stack.
 pub fn walk_tree(base: &Path, excluded: &[String]) -> Option<(Vec<FileEnt>, u64, usize)> {
     if std::fs::read_dir(base).is_err() {
         crate::synclog::write(&format!(
             "[WALK-FAIL] source unreadable — backup ABORTED: {}", base.display()));
         return None;
     }
-    let mut out = Vec::with_capacity(4096);
+    let mut out: Vec<FileEnt> = Vec::with_capacity(4096);
     let mut total = 0u64;
     let mut failed_dirs: Vec<String> = Vec::new();
-    walk_inner(base, base, excluded, &mut out, &mut total, &mut failed_dirs);
+    // Explicit stack of directories to visit. Push children in reverse order
+    // so the walk visits them in the same order the recursion did.
+    let mut stack: Vec<PathBuf> = vec![base.to_path_buf()];
+    while let Some(current) = stack.pop() {
+        let entries = match std::fs::read_dir(&current) {
+            Ok(e) => e,
+            Err(_) => {
+                failed_dirs.push(current.to_string_lossy().to_string());
+                continue;
+            }
+        };
+        // collect dirs first so we can reverse-push
+        let mut subdirs: Vec<PathBuf> = Vec::new();
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name_s = name.to_string_lossy();
+            if excluded.iter().any(|e| e.as_str() == name_s.as_ref()) { continue; }
+
+            let ft = match entry.file_type() { Ok(t) => t, Err(_) => continue };
+            if ft.is_symlink() { continue; }
+
+            let path = entry.path();
+            if ft.is_dir() {
+                subdirs.push(path);
+            } else {
+                let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
+                total += size;
+                let rel = path.strip_prefix(base).unwrap_or(&path).to_path_buf();
+                out.push(FileEnt { path, rel, size });
+            }
+        }
+        for d in subdirs.into_iter().rev() {
+            stack.push(d);
+        }
+    }
     if !failed_dirs.is_empty() {
         let mut msg = String::from("[WALK-WARN] unreadable subfolders EXCLUDED from backup:");
         for d in failed_dirs.iter().take(20) {
@@ -823,7 +859,7 @@ pub fn compress_folder(
         Err(_) => { progress.finish(4); return (false, vec![]); } // M-1
     };
     let threads = std::thread::available_parallelism().map(|n| n.get() as u32).unwrap_or(4);
-    let _ = encoder.multithread(threads);
+    let _ = encoder.multithread(threads); // multi-threaded compression (zstd workers)
     let _ = encoder.include_checksum(true); // H3: frame checksum — bit rot fails LOUD, not silently
     let mut builder = tar::Builder::new(encoder.auto_finish());
 
@@ -1109,7 +1145,7 @@ fn compute_manifest(files: &[FileEnt], progress: Option<&crate::synclog::Progres
         .par_iter()
         .map(|f| {
             let h = hash_file(&f.path).unwrap_or(0);
-            if let Some(p) = progress { p.tick_bytes(f.size.max(1)); }
+            if let Some(p) = progress { p.tick(f.size.max(1)); } // files+bytes — live "N files" display
             FileMeta { p: manifest_key(&f.rel), s: f.size, h }
         })
         .collect()
@@ -1117,12 +1153,15 @@ fn compute_manifest(files: &[FileEnt], progress: Option<&crate::synclog::Progres
 
 /// FNV-1a based content hash (64-bit). Non-cryptographic by design: we detect
 /// accidental change, not adversarial tampering. ~memory-bandwidth speed.
+/// v1.6.2: read buffer on the HEAP — the 64KB stack array, inlined by LTO into
+/// rayon's split-recursion frames, caused the stack-overflow crashes (each
+/// recursion level carried a giant frame; a worker's 2MB stack died in ~15 levels).
 fn hash_file(path: &Path) -> Option<u64> {
     use std::io::Read;
     let f = std::fs::File::open(path).ok()?;
     let mut reader = std::io::BufReader::with_capacity(1 << 20, f);
     let mut hash: u64 = 0xcbf29ce484222325; // FNV offset basis
-    let mut buf = [0u8; 65536];
+    let mut buf = vec![0u8; 65536]; // heap — no giant stack frame
     loop {
         let n = reader.read(&mut buf).ok()?;
         if n == 0 { break; }
@@ -1634,7 +1673,7 @@ pub fn sync_all_pairs() {
     let mut restored_names: Vec<String> = vec![];
 
     crate::synclog::write("------------------------------------------------------------");
-    crate::synclog::write("Sync cycle");
+    crate::synclog::write(&format!("Sync cycle — {}", crate::crashlog::version_stamp()));
     crate::synclog::write_progress("");
 
     for j in &cfg.junctions {

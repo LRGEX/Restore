@@ -1,6 +1,6 @@
 [package]
 name = "lrgex_restore"
-version = "1.6.1"
+version = "1.6.2"
 edition = "2021"
 
 [[bin]]
@@ -12,7 +12,7 @@ slint = { version = "1.17", features = ["backend-winit", "renderer-software"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 winreg = "0.55"
-windows-sys = { version = "0.59", features = ["Win32_System_Threading", "Win32_Foundation", "Win32_UI_Shell", "Win32_System_Com"] }
+windows-sys = { version = "0.59", features = ["Win32_System_Threading", "Win32_Foundation", "Win32_UI_Shell", "Win32_System_Com", "Win32_System_Console", "Win32_Storage_FileSystem", "Win32_Security"] }
 chrono = "0.4"
 rfd = "0.15"
 ureq = { version = "2", features = ["json"] }
@@ -29,6 +29,7 @@ opt-level = 3
 lto = "fat"
 codegen-units = 1
 strip = true
+
 
 [build-dependencies]
 winres = "0.1"

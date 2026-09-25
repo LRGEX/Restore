@@ -165,13 +165,10 @@ pub fn find_game_saves(existing: &[String]) -> Vec<FoundSave> {
         }
     }
 
-    // 4. Steam: registry SteamPath + libraryfolders.vdf → userdata (all cloud saves,
-    //    renumbering-safe level). Game installs: offer ONLY save subdirs, never installs.
+    // 4. Steam: registry SteamPath + libraryfolders.vdf → game installs ONLY.
+    //    v1.6.2: userdata (official Steam Cloud) is deliberately EXCLUDED —
+    //    Steam syncs those itself; backing them up is redundant.
     for lib in steam_libraries() {
-        let userdata = lib.join("userdata");
-        if userdata.is_dir() && dir_nonempty(&userdata) {
-            push(userdata, "Steam cloud saves (userdata)", &mut out);
-        }
         let common = lib.join("steamapps").join("common");
         if let Ok(games) = std::fs::read_dir(&common) {
             for g in games.flatten() {

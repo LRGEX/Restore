@@ -183,14 +183,19 @@ impl Progress {
     }
 
     /// Spawns a writer that updates sync-progress.json every 500ms regardless of progress.
+    /// v1.6.2: NAMED thread — the stack-overflow crashes printed
+    /// `thread '<unknown>'`; a name turns the next crash into a diagnosis.
     pub fn spawn_writer(&self) -> std::thread::JoinHandle<()> {
         let me = self.clone();
-        std::thread::spawn(move || {
-            while !me.inner.stop.load(Ordering::Relaxed) {
-                me.write_snapshot();
-                std::thread::sleep(Duration::from_millis(500));
-            }
-        })
+        std::thread::Builder::new()
+            .name("lrgex-heartbeat".into())
+            .spawn(move || {
+                while !me.inner.stop.load(Ordering::Relaxed) {
+                    me.write_snapshot();
+                    std::thread::sleep(Duration::from_millis(500));
+                }
+            })
+            .expect("spawn heartbeat")
     }
 
     fn write_snapshot(&self) {

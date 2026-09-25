@@ -7,8 +7,12 @@ mod health;
 mod gui;
 mod update;
 mod gamescan;
+mod crashlog;
 
 fn main() {
+    // v1.6.2: crash forensics — stderr (runtime abort messages) into a file.
+    // During the stack-overflow hunt the killer clue was on invisible stderr.
+    crashlog::capture_stderr();
     // Crash logger: write to sync.log (no separate file)
     std::panic::set_hook(Box::new(|info| {
         crate::synclog::write(&format!("CRASH: {}", info));
