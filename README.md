@@ -32,7 +32,7 @@ You know the feeling.
 
 Windows is fresh. Your apps are reinstalled. Then you launch your favorite game...
 
-**Your saves are gone, or important folders is gone!**
+**Your saves are gone. Your important folders are gone.**
 
 Your application settings? **Gone.**
 
@@ -45,11 +45,11 @@ Hours of progress and years of customization disappear because Windows doesn't p
 ## How it works
 
 1. **Choose a folder** — game saves, app settings, projects, or anything important.
-2. **LRGEX Restore watches it** — changes are compressed and synchronized automatically.
+2. **LRGEX Restore backs it up automatically** — changes are compressed and stored in your backup folder on your sync schedule.
 3. **Reinstall Windows** — without worrying about lost files.
 4. **Restore with one click** — every folder returns to its original location automatically.
 
-**Set it once. Forget about it. Your files are always there when you need them.**
+**Set it once. Forget about it. Your files are there when you need them.**
 
 ---
 
@@ -67,8 +67,9 @@ Hours of progress and years of customization disappear because Windows doesn't p
 ## Features
 
 - **Automatic backup** — new and changed files back up to your cloud automatically
-- **Snapshot versioning** — every change creates a snapshot. Roll back any folder to any previous version (depth set by Max Versions)
+- **Snapshot versioning** — changes are captured as a snapshot on each sync run. Roll back any folder to a previous snapshot (depth set by Max Versions)
 - **Auto-restore** — after a format, missing folders are restored automatically
+- **Drive-letter healing** — if your drives get different letters after a format, paths are fixed automatically and backups follow
 - **Right-click integration** — right-click any folder in Explorer to protect it
 - **Configurable sync interval** — 1 minute or more, your choice
 - **Exclusions** — skip app-locked subfolders that cause false errors
@@ -108,7 +109,7 @@ Every item in **Tools**, what it does, and when to use it:
 3. Open the app from the home folder
 4. Right-click any folder you want to protect — select **"Add to LRGEX Restore"** (menu is enabled automatically; toggle via Tools → Right-Click Sync)
 
-Your folders are now backed up continuously.
+Your folders are now backed up automatically on your sync schedule.
 
 ---
 
@@ -116,7 +117,7 @@ Your folders are now backed up continuously.
 
 1. Reinstall your cloud service and let it download
 2. Open `LRGEXRestore.exe` from your home folder
-3. Click **"Restore Saved"** — or let auto-restore handle it automatically
+3. Click **"Restore Saved"** — or enable auto-restore per folder to make it automatic
 
 Every folder goes back to its exact original path.
 
@@ -129,7 +130,7 @@ Every folder goes back to its exact original path.
 
 ## Windows Defender false positive
 
-Windows Defender may flag LRGEX Restore as a false positive (`Trojan:Win32/Bearfoos.B!ml` / `Behavior:Win32/Persistence.A!ml`). **This is a confirmed false positive.** The exe is [verified clean on VirusTotal](https://www.virustotal.com/gui/file-analysis/Y2U4ZjhhYmM3ZDc0NDRkNzk5MDZhMjdhYjAxYzNjNzk6MTc4NjczMTY3Ng==) — 0 detections across 70+ engines. Defender's machine learning flags the app because it:
+Windows Defender may flag LRGEX Restore as a false positive (`Trojan:Win32/Bearfoos.B!ml` / `Behavior:Win32/Persistence.A!ml`). The exe has been [scanned on VirusTotal](https://www.virustotal.com/gui/file-analysis/Y2U4ZjhhYmM3ZDc0NDRkNzk5MDZhMjdhYjAxYzNjNzk6MTc4NjczMTY3Ng==) with no detections at the time of scanning. Defender's machine learning flags the app because it:
 
 - Copies itself to your chosen home folder (self-copy)
 - Creates a scheduled task for automatic syncing (persistence)
