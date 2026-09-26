@@ -67,7 +67,7 @@ Hours of progress and years of customization disappear because Windows doesn't p
 ## Features
 
 - **Automatic backup** — new and changed files back up to your cloud automatically
-- **Snapshot versioning** — every change creates a snapshot. Roll back any folder to any previous version
+- **Snapshot versioning** — every change creates a snapshot. Roll back any folder to any previous version (depth set by Max Versions)
 - **Auto-restore** — after a format, missing folders are restored automatically
 - **Right-click integration** — right-click any folder in Explorer to protect it
 - **Configurable sync interval** — 1 minute or more, your choice
@@ -96,6 +96,7 @@ Every item in **Tools**, what it does, and when to use it:
 | **View Sync Log** | The full technical log of every sync cycle: what was backed up, what was skipped and why, heal/migration events | When diagnosing behavior or checking what happened in the last sync |
 | **Export Configuration** | Saves your folder list and settings to a file | Before a format (belt-and-suspenders alongside your cloud copy) or to clone your setup to another PC |
 | **Import Configuration** | Loads a previously exported configuration | On a new PC, to restore your folder list in one step |
+| **Right-Click Sync** (toggle) | Enables/disables the "Add to LRGEX Restore" entry in Windows Explorer's right-click menu — ON by default | If you don't want the context-menu entry, or want it back after disabling |
 | **Unlink from Windows…** | Removes the scheduled task, right-click menu, and registry entries — full clean uninstall of Windows integration | When you want to stop using the app or reset its Windows hooks |
 
 ---
