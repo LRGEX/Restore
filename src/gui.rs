@@ -2046,19 +2046,49 @@ fn setup_home() {
         .set_title("First Run Setup")
         .set_description("Pick the folder where LRGEX Restore will live.
 
+Everything — the app, your backups, and settings — will be placed inside ONE folder.
+
 RECOMMENDED: a folder inside a cloud service (OneDrive, Google Drive, etc.) so your backups survive a PC format.")
         .set_buttons(rfd::MessageButtons::Ok)
         .show();
 
-    let home = rfd::FileDialog::new()
-        .set_title("Select LRGEX Restore folder")
+    let picked = rfd::FileDialog::new()
+        .set_title("Select destination folder")
         .pick_folder();
 
-    if let Some(home) = home {
+    if let Some(picked) = picked {
+        // v1.7.1: ask HOW to use the picked folder.
+        // Yes    = create a dedicated "LRGEX-saves" subfolder (clean isolation)
+        // No     = use the folder directly (scaffold in its root)
+        // Cancel = user wants a CUSTOM name: they create+pick the folder themselves
+        let choice = rfd::MessageDialog::new()
+            .set_title("How to use this folder?")
+            .set_description(&format!(
+                "You picked:\n{}\n\nYES — Create a dedicated 'LRGEX-saves' subfolder here (recommended: everything stays isolated in one place).\n\nNO — Use this folder directly. The app, backups, and settings will be created in its root, alongside anything already inside it.\n\nCANCEL — Use a differently-named folder: create it yourself, then pick it.",
+                picked.display()))
+            .set_buttons(rfd::MessageButtons::YesNoCancel)
+            .show();
+
+        let home = match choice {
+            rfd::MessageDialogResult::Yes => picked.join("LRGEX-saves"),
+            rfd::MessageDialogResult::No => picked,
+            _ => {
+                // Custom name: user creates the folder, picks it
+                match rfd::FileDialog::new()
+                    .set_title("Pick your folder (create it first if needed)")
+                    .pick_folder()
+                {
+                    Some(f) => f,
+                    None => return, // cancelled setup entirely
+                }
+            }
+        };
+
         if let Ok(exe) = std::env::current_exe() {
             let exe_name = exe.file_name()
                 .map(|n| n.to_string_lossy().to_string())
                 .unwrap_or_else(|| "LRGEXRestore.exe".into());
+            let _ = std::fs::create_dir_all(&home);
             let dest = home.join(&exe_name);
             let _ = std::fs::copy(&exe, &dest);
             let _ = std::fs::create_dir_all(home.join(".lrgex"));
