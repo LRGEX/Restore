@@ -1,5 +1,30 @@
 # Patch Notes — LRGEX Restore
 
+## v1.7.0 — Format-survival complete: drive healing + real mtimes
+
+### NEW: survives drive-letter reshuffles after a Windows format
+- Every protected folder records its disk's stable Volume GUID at backup time
+- If Windows format renames your drives (E: becomes D:), the app automatically rewrites the path to the new letter AND moves the backup so it follows — no re-backup, no orphans
+- Works for older configs too: if the drive letter vanished and the same folder path exists on exactly one other drive, it heals; ambiguous cases are refused, never guessed
+- Tools → Repair Missing Folders: if a drive was replaced or reformatted, pick the new location once — the backup follows
+
+### NEW: real file dates survive backup → format → restore
+- Backups now record each file's real modification time (previously zeroed)
+- Restored files keep their original dates — games and save managers that sort by date keep working
+- Restores onto FAT32 / SD cards fully supported: dates are clamped to what FAT32 can store, and old-format archives automatically fall back safely
+
+### First-run setup: you choose how the folder is used
+- Picking a destination now asks: create a dedicated "LRGEX-saves" subfolder (recommended — everything isolated in one place), use the folder directly, or pick your own named folder
+- No more app scaffold (backups, settings, versions) created inside a folder you already use, without asking
+
+### Fixed: crash during backup of large folders
+- A 64 KB memory buffer lived on a thread's limited stack inside the parallel scanning engine and crashed long-running syncs (stack overflow) — it now lives on the heap
+- If a sync is ever interrupted again, the app logs the exact reason to `update.log` and `stderr.log` instead of failing silently
+
+### Smarter Find Game Saves
+- Games with ACTIVE Steam Cloud (e.g. Kerbal Space Program) are skipped — Steam already syncs those saves; games without cloud support (e.g. Empyrion) and locally-installed games are offered
+- Detection is local and factual: the game's Steam sync record decides, no assumptions
+
 ## v1.6.1 — Self-healing syncs + orphan cleanup
 
 ### Self-healing
