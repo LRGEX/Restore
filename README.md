@@ -67,7 +67,7 @@ Hours of progress and years of customization disappear because Windows doesn't p
 ## Features
 
 - **Automatic backup** — new and changed files back up to your cloud automatically
-- **Snapshot versioning** — every change creates a snapshot. Roll back any folder to any point in the last 90 days
+- **Snapshot versioning** — every change creates a snapshot. Roll back any folder to any previous version
 - **Auto-restore** — after a format, missing folders are restored automatically
 - **Right-click integration** — right-click any folder in Explorer to protect it
 - **Configurable sync interval** — 1 minute or more, your choice
@@ -78,8 +78,25 @@ Hours of progress and years of customization disappear because Windows doesn't p
 
 ### What happens when you delete files?
 
-- **Delete one file**: it leaves the backup. The old version lives in versioning for 90 days. Does NOT come back on restore.
+- **Delete one file**: it leaves the backup. The old version lives in versioning. Does NOT come back on restore.
 - **Delete the entire folder**: if auto-restore is ON, auto-restore brings it all back.
+
+### The Tools menu, explained
+
+Every item in **Tools**, what it does, and when to use it:
+
+| Tool | What it does | When to use it |
+|---|---|---|
+| **Junction Health Check** | Lists every protected folder with its backup size, last-backup age, and source status — a full checkup of your protection | Anytime you want to verify everything is healthy |
+| **Find Game Saves…** | Scans your PC's known save locations (Windows Saved Games, Documents\My Games, WB Games, Steam game folders, Microsoft Store saves) and offers to protect what it finds. Games already synced by Steam Cloud are skipped automatically | After installing the app — find your game saves in one click instead of hunting for them manually |
+| **Repair Missing Folders…** | If a protected folder's drive was replaced, reformatted, or its path can't be found, this lets you pick the folder's new location — the backup follows automatically | After a format where a drive letter changed in a way auto-healing couldn't resolve, or after swapping a dead drive |
+| **Set Sync Interval…** | How often the scheduled backup runs — from 1 minute to 31 days (default: 24 hours) | If you want more or less frequent backups |
+| **Set Max Versions…** | How many historical snapshots to keep per folder (default: 2) | If you want deeper history to roll back to |
+| **Manage Exclusions…** | Folders/files by name that are skipped during backup (e.g. cache dirs, lock files that cause false errors) | If the sync log shows "[SKIP] locked/unreadable" for files you don't care about |
+| **View Sync Log** | The full technical log of every sync cycle: what was backed up, what was skipped and why, heal/migration events | When diagnosing behavior or checking what happened in the last sync |
+| **Export Configuration** | Saves your folder list and settings to a file | Before a format (belt-and-suspenders alongside your cloud copy) or to clone your setup to another PC |
+| **Import Configuration** | Loads a previously exported configuration | On a new PC, to restore your folder list in one step |
+| **Unlink from Windows…** | Removes the scheduled task, right-click menu, and registry entries — full clean uninstall of Windows integration | When you want to stop using the app or reset its Windows hooks |
 
 ---
 
