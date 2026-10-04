@@ -91,6 +91,41 @@ pub fn is_pid_alive(pid: u32) -> bool {
     }
 }
 
+/// v1.7.1: PID-REUSE fix — Windows recycles PID numbers. A dead sync's PID can
+/// be reassigned to ANY process (Node.js, Explorer, whatever), making the old
+/// is_pid_alive check say "alive" when the sync is long dead. This checks the
+/// process NAME too: the sync is only alive if the PID belongs to LRGEXRestore.
+#[cfg(target_os = "windows")]
+pub fn is_our_pid(pid: u32) -> bool {
+    use windows_sys::Win32::System::Threading::{
+        OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+        QueryFullProcessImageNameW,
+    };
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use std::os::windows::ffi::OsStrExt;
+
+    unsafe {
+        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if handle.is_null() {
+            // Can't open — treat as dead (conservative: better to self-heal
+            // than to sit frozen on stale progress forever)
+            return false;
+        }
+        let mut buf = [0u16; 512];
+        let mut len = buf.len() as u32;
+        let ok = QueryFullProcessImageNameW(handle, 0, buf.as_mut_ptr(), &mut len);
+        CloseHandle(handle);
+        if ok == 0 { return false; }
+        let name = String::from_utf16_lossy(&buf[..len as usize]);
+        let lower = name.to_lowercase();
+        // Match our exe name — the process image must be LRGEXRestore
+        lower.contains("lrgexrestore")
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn is_our_pid(_pid: u32) -> bool { false }
+
 pub fn read_tail(n: usize) -> String {
     match std::fs::read_to_string(log_path()) {
         Ok(data) => {

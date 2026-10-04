@@ -1814,7 +1814,7 @@ Failed: {}", failures.join(", ")));
                     // must not loop retries forever.
                     let now = std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
-                    if now.saturating_sub(s.heartbeat) > 15 && !synclog::is_pid_alive(s.pid) {
+                    if now.saturating_sub(s.heartbeat) > 15 && !synclog::is_our_pid(s.pid) {
                         let heal_state = heal_state.clone();
                         let w_heal = w.clone();
                         use chrono::TimeZone;
@@ -2011,6 +2011,12 @@ Failed: {}", failures.join(", ")));
     // Disable maximize/resize — app looks bad maximized
 
     app.run().unwrap();
+
+    // v1.7.1: user closed the window — FORCE-EXIT. Without this, the process
+    // lingers invisibly because spawned threads (self-heal sync, heartbeats)
+    // keep it alive, eating CPU with no window. Backups are safe: temp+rename
+    // protection means a killed sync never corrupts anything.
+    std::process::exit(0);
 }
 
 // ==================== POST-LAUNCH CHECKS ====================
