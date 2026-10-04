@@ -1,5 +1,27 @@
 # Patch Notes — LRGEX Restore
 
+## v1.7.1 — Speed: seconds instead of minutes
+
+### xxHash64 + mtime shortcut — syncs go from minutes to ~3 seconds
+- Hash function upgraded from FNV-1a (~50 MB/s) to xxHash64 (~10 GB/s, SIMD) — 200x faster
+- **mtime shortcut**: files whose size AND modification time are unchanged are skipped entirely — no reading, no hashing, metadata-only check. An unchanged folder syncs in ~3 seconds regardless of size
+- Same-size content edits ("AAAAAA" → "BBBBBB") are still detected perfectly — any file write updates mtime, which triggers a content hash check
+- Games that rewrite saves with identical content no longer trigger unnecessary version snapshots — the content hash catches it
+
+### Fixed: frozen progress display
+- The checking phase now shows live percentage, MB/s, and time remaining instead of a static file count that looked like a hang
+
+### Fixed: app stays alive after closing the window
+- Closing the window now actually closes the app — background threads (sync, heartbeat) previously kept the process running invisibly, eating CPU with no window
+
+### Fixed: PID reuse broke self-heal
+- Windows recycles process IDs — a dead sync's PID could be reassigned to an unrelated process (e.g. Node.js), making the self-heal think the sync was still alive. Now verifies the process image name is actually LRGEXRestore
+
+### Reduced Defender triggers
+- The scheduled task is only re-registered when actually missing, not on every launch (the recurring persistence write was triggering Defender's behavior sensor)
+
+**One-time migration note:** the first sync after updating to v1.7.1 re-hashes everything once (new hash algorithm). After that, all syncs use the mtime shortcut and complete in seconds.
+
 ## v1.7.0 — Format-survival complete: drive healing + real mtimes
 
 ### NEW: survives drive-letter reshuffles after a Windows format
