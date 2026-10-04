@@ -665,8 +665,18 @@ mod tests {
         let files = vec![ent(&f, &dir)];
         let stored = compute_manifest(&files, None);
 
-        // User edits to "BBBBBB" — SAME SIZE, DIFFERENT CONTENT
+        // User edits to "BBBBBB" — SAME SIZE, DIFFERENT CONTENT.
+        // v1.7.1: force a distinct mtime — the mtime-shortcut legitimately skips
+        // same-second same-size edits (standard rsync-style tradeoff). This test
+        // verifies that a REAL edit (different mtime) IS caught even at same size.
         std::fs::write(&f, b"BBBBBB").unwrap();
+        {
+            use std::os::windows::fs::FileExt;
+            let fh = std::fs::OpenOptions::new().write(true).open(&f).unwrap();
+            let _ = fh.set_modified(
+                std::time::SystemTime::now() + std::time::Duration::from_secs(5)
+            );
+        }
         let files2 = vec![ent(&f, &dir)];
         let (changed, _) = detect_change(&stored, &files2, None);
         assert!(changed, "Same-size content edit MUST be detected");
@@ -760,8 +770,8 @@ mod tests {
         let sidecar = dir.join("sidecar.txt");
 
         let manifest = vec![
-            FileMeta { p: "sub/file1.txt".into(), s: 100, h: 0xdeadbeef },
-            FileMeta { p: "locked.db".into(), s: 9999, h: 0 },
+            FileMeta { p: "sub/file1.txt".into(), s: 100, h: 0xdeadbeef, m: 0 },
+            FileMeta { p: "locked.db".into(), s: 9999, h: 0, m: 0 },
         ];
         write_stored_manifest(&sidecar, &manifest);
 
@@ -1222,8 +1232,12 @@ struct FileMeta {
     /// Relative path, forward-slash separated (portable across the config).
     p: String,
     s: u64,
-    /// xxhash-style content hash — 0 means "unknown" (locked at manifest build).
+    /// xxHash64 content hash — 0 means "unknown" (locked at manifest build).
     h: u64,
+    /// File modification time (unix secs) — the MTIME SHORTCUT: if size AND
+    /// mtime match the manifest, the file is skipped without reading/hashing.
+    #[serde(default)]
+    m: u64,
 }
 
 fn manifest_key(rel: &Path) -> String {
@@ -1234,37 +1248,59 @@ fn manifest_key(rel: &Path) -> String {
 /// Returns None per-file on read failure (locked), keeping size for fallback.
 /// `progress`: optional live ticker — the content-hash pass is the LONGEST
 /// phase on big folders (2 GB ≈ 90 s) and must not be invisible.
+/// SMART MANIFEST: mtime-shortcut — files whose stored size AND mtime match
+/// carry their stored hash forward WITHOUT reading/hashing the content.
+/// Only new files or files with changed size/mtime get hashed. Result: an
+/// unchanged folder is a metadata-only instant check instead of a full 2 GB read.
 fn compute_manifest(files: &[FileEnt], progress: Option<&crate::synclog::Progress>) -> Vec<FileMeta> {
+    compute_manifest_smart(files, None, progress)
+}
+
+fn compute_manifest_smart(
+    files: &[FileEnt],
+    stored: Option<&[FileMeta]>,
+    progress: Option<&crate::synclog::Progress>,
+) -> Vec<FileMeta> {
+    use std::collections::HashMap;
+    let stored_map: HashMap<&str, &FileMeta> = stored
+        .map(|s| s.iter().map(|m| (m.p.as_str(), m)).collect())
+        .unwrap_or_default();
     files
         .par_iter()
         .map(|f| {
+            let key = manifest_key(&f.rel);
+            if let Some(s) = stored_map.get(key.as_str()) {
+                if s.s == f.size && s.m == f.mtime && s.h != 0 {
+                    // MTIME SHORTCUT: size + mtime unchanged → carry the stored hash.
+                    // No disk read, no hash computation — instant.
+                    if let Some(p) = progress { p.tick(f.size.max(1)); }
+                    return FileMeta { p: key, s: f.size, h: s.h, m: f.mtime };
+                }
+            }
+            // New file, or size/mtime changed → hash it for real
             let h = hash_file(&f.path).unwrap_or(0);
-            if let Some(p) = progress { p.tick(f.size.max(1)); } // files+bytes — live "N files" display
-            FileMeta { p: manifest_key(&f.rel), s: f.size, h }
+            if let Some(p) = progress { p.tick(f.size.max(1)); }
+            FileMeta { p: key, s: f.size, h, m: f.mtime }
         })
         .collect()
 }
 
-/// FNV-1a based content hash (64-bit). Non-cryptographic by design: we detect
-/// accidental change, not adversarial tampering. ~memory-bandwidth speed.
-/// v1.6.2: read buffer on the HEAP — the 64KB stack array, inlined by LTO into
-/// rayon's split-recursion frames, caused the stack-overflow crashes (each
-/// recursion level carried a giant frame; a worker's 2MB stack died in ~15 levels).
+/// xxHash64 — SIMD-accelerated, non-cryptographic. ~10 GB/s per core vs
+/// FNV-1a's ~50 MB/s. Detects accidental change (our threat model), not
+/// adversarial tampering. Used by ZFS, LZ4, and countless backup tools.
 fn hash_file(path: &Path) -> Option<u64> {
     use std::io::Read;
+    use xxhash_rust::xxh64::Xxh64;
     let f = std::fs::File::open(path).ok()?;
     let mut reader = std::io::BufReader::with_capacity(1 << 20, f);
-    let mut hash: u64 = 0xcbf29ce484222325; // FNV offset basis
+    let mut hasher = Xxh64::new(0);
     let mut buf = vec![0u8; 65536]; // heap — no giant stack frame
     loop {
         let n = reader.read(&mut buf).ok()?;
         if n == 0 { break; }
-        for &b in &buf[..n] {
-            hash ^= b as u64;
-            hash = hash.wrapping_mul(0x100000001b3);
-        }
+        hasher.update(&buf[..n]);
     }
-    Some(hash)
+    Some(hasher.digest())
 }
 
 fn parse_manifest_totals(json: &str) -> Option<(u64, usize)> {
@@ -1284,7 +1320,9 @@ fn read_stored_manifest(sidecar: &Path) -> Option<Vec<FileMeta>> {
 /// whose result is REUSED as the new manifest if a backup is triggered, so the
 /// total cost is exactly one read pass per sync, never two.
 fn detect_change(stored: &[FileMeta], current_files: &[FileEnt], progress: Option<&crate::synclog::Progress>) -> (bool, Vec<FileMeta>) {
-    let current = compute_manifest(current_files, progress);
+    // SMART: pass the stored manifest — the mtime shortcut skips hashing for
+    // files whose size+mtime are unchanged (99.9% of files on a typical sync).
+    let current = compute_manifest_smart(current_files, Some(stored), progress);
     if stored.len() != current.len() { return (true, current); }
     let map: std::collections::HashMap<&str, &FileMeta> =
         stored.iter().map(|m| (m.p.as_str(), m)).collect();
@@ -1515,7 +1553,15 @@ pub fn sync_pair_to_cloud(source: &str, excluded: &[String], max_versions: i32, 
                 let (changed, m) = detect_change(&stored, &walked.0, Some(&hp));
                 hp.finish(4); // hashing done — compress_folder takes over the display
                 let _ = hw.join();
-                if changed { manifest = Some(m); }
+                if changed {
+                    manifest = Some(m);
+                } else {
+                    // v1.7.1: persist the ENRICHED manifest (with mtime data) even
+                    // when unchanged — old manifests have m=0 (serde default),
+                    // which never matches real mtimes, so without this write the
+                    // mtime shortcut would NEVER activate.
+                    write_stored_manifest(&sidecar, &m);
+                }
                 changed
             }
         }

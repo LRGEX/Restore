@@ -738,7 +738,14 @@ pub fn run() {
 
     // Self-heal: register task using canonical home (never current_exe)
     let cfg0 = config::load_config();
-    sync::register_sync_task(cfg0.sync_interval_minutes);
+    // v1.7.1: only register when MISSING — re-running `schtasks /Create /F`
+    // on every launch was the recurring persistence write that kept triggering
+    // Defender's behavior sensor (Behavior:Win32/Persistence.A!ml). The query
+    // (task_exists) is a read and doesn't trip the sensor. Interval changes
+    // re-register via the explicit settings dialog.
+    if !health::task_exists() {
+        sync::register_sync_task(cfg0.sync_interval_minutes);
+    }
     config::ensure_versions_setup();
 
     let app = App::new().unwrap();
@@ -1852,7 +1859,24 @@ Failed: {}", failures.join(", ")));
                     }
                     let pct = if s.bytes_total > 0 { s.bytes_done * 100 / s.bytes_total } else { 0 };
                     let text = match s.phase {
-                        0 => format!(" {} Scanning {} — {} files ", FRAMES[spin], s.label, s.files_done),
+                        // v1.7.1: phase 0 shows %/MB/s/ETA when totals are known (the
+                        // hash/checking phase pre-sets totals). The REAL walk phase has
+                        // no totals yet — falls back to plain file count.
+                        0 => {
+                            if s.bytes_total > 0 {
+                                let pct = s.bytes_done * 100 / s.bytes_total;
+                                format!(
+                                    " {} {} — {}%  ({}/{} MB, {:.0} MB/s, {}{}) ",
+                                    FRAMES[spin], s.label, pct,
+                                    s.bytes_done / 1_048_576, s.bytes_total / 1_048_576,
+                                    s.bytes_done as f64 / 1_048_576.0 / s.elapsed,
+                                    fmt_dur(s.elapsed),
+                                    if s.eta > 0 { format!(", ~{} left", fmt_dur(s.eta as f64)) } else { String::new() }
+                                )
+                            } else {
+                                format!(" {} {} — {} files ", FRAMES[spin], s.label, s.files_done)
+                            }
+                        }
                         2 => format!(" {} Finalizing {} ", FRAMES[spin], s.label),
                         _ => format!(
                             " {} {} — {}%  ({}/{} MB, {:.0} MB/s, {}{}) ",

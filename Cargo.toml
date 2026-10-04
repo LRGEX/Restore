@@ -23,6 +23,7 @@ hex = "0.4"
 ed25519-dalek = "2"
 rand = "0.8"
 rayon = "1"
+xxhash-rust = { version = "0.8.19", features = ["xxh64"] }
 
 [profile.release]
 opt-level = 3
