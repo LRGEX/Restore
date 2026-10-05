@@ -10,6 +10,13 @@ slint::slint! {
         is_game: bool,
     }
 
+    export struct GameSaveEntry {
+        name: string,
+        path: string,
+        reason: string,
+        selected: bool,
+    }
+
     export struct VersionEntry {
         display: string,
     }
@@ -50,6 +57,15 @@ slint::slint! {
         in-out property <int> selected-index: -1;
         in-out property <bool> versions-visible: false;
         in-out property <[VersionEntry]> versions-list: [];
+
+        // v1.7.2: Find Game Saves — checkbox selection panel
+        in-out property <bool> findgames-visible: false;
+        in-out property <[GameSaveEntry]> findgames-list: [];
+        in-out property <bool> findgames-all-checked: true;
+        callback findgames-confirm();
+        callback findgames-cancel();
+        callback findgames-toggle-all(bool);
+        callback findgames-toggle(int);
         in-out property <int> selected-version: -1;
         in-out property <string> app-version: "";
         in-out property <string> versions-title: "Versions";
@@ -465,6 +481,126 @@ slint::slint! {
         }
 
         // Input dialog overlay
+        // v1.7.2: Find Game Saves — checkbox selection overlay
+        if root.findgames-visible : Rectangle {
+            x: 0px; y: 0px; width: root.width; height: root.height;
+            background: rgba(0, 0, 0, 0.75);
+            TouchArea { clicked => {} }  // block click-through
+
+            Rectangle {
+                x: (root.width - self.width) / 2;
+                y: (root.height - self.height) / 2;
+                width: 480px;
+                height: 420px;
+                background: #1e1e1e;
+                border-radius: 8px;
+                border-width: 1px;
+                border-color: #3a3a3a;
+
+                VerticalLayout {
+                    padding: 16px;
+                    spacing: 12px;
+
+                    Text {
+                        text: "Found " + root.findgames-list.length + " save location(s)";
+                        color: white;
+                        font-size: 16px;
+                        font-weight: 700;
+                    }
+
+                    // Select All / Deselect All toggle
+                    Rectangle {
+                        height: 34px;
+                        border-radius: 4px;
+                        background: ta.has-hover ? #2a2a2a : #252525;
+                        border-width: 1px; border-color: #3a3a3a;
+                        ta := TouchArea {
+                            clicked => { root.findgames-toggle-all(!root.findgames-all-checked); }
+                        }
+                        HorizontalLayout {
+                            padding-left: 10px; spacing: 8px;
+                            Text {
+                                text: root.findgames-all-checked ? "☑" : "☐";
+                                color: #cb803c; font-size: 18px;
+                                vertical-alignment: center;
+                            }
+                            Text {
+                                text: root.findgames-all-checked ? "Deselect All" : "Select All";
+                                color: #aaa; font-size: 13px;
+                                vertical-alignment: center;
+                            }
+                        }
+                    }
+
+                    // Scrollable list of found saves with checkboxes
+                    Flickable {
+                        vertical-stretch: 1;
+                        VerticalLayout {
+                            spacing: 6px;
+                            for entry[i] in root.findgames-list : Rectangle {
+                                height: 52px;
+                                border-radius: 4px;
+                                background: ta2.has-hover ? #2a2a2a : transparent;
+                                border-width: 1px;
+                                border-color: entry.selected ? #cb803c : #333;
+                                ta2 := TouchArea {
+                                    clicked => {
+                                        root.findgames-toggle(i);
+                                    }
+                                }
+                                HorizontalLayout {
+                                    padding-left: 10px; padding-right: 10px;
+                                    spacing: 10px;
+                                    VerticalLayout {
+                                        alignment: center; spacing: 2px;
+                                        Text {
+                                            text: entry.name;
+                                            color: white; font-size: 13px; font-weight: 600;
+                                        }
+                                        Text {
+                                            text: entry.reason;
+                                            color: #888; font-size: 11px;
+                                        }
+                                    }
+                                    Rectangle { width: 1px; background: #333; }
+                                    Text {
+                                        text: entry.path;
+                                        color: #aaa; font-size: 10px;
+                                        vertical-alignment: center;
+                                        horizontal-stretch: 1;
+                                        overflow: elide;
+                                    }
+                                    Text {
+                                        text: entry.selected ? "☑" : "☐";
+                                        color: #cb803c; font-size: 20px;
+                                        vertical-alignment: center;
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // Buttons
+                    HorizontalLayout {
+                        alignment: center; spacing: 12px;
+                        Rectangle {
+                            width: 140px; height: 36px; border-radius: 4px;
+                            background: btnAdd.has-hover ? #d4883f : #cb803c;
+                            btnAdd := TouchArea { clicked => { root.findgames-confirm(); } }
+                            Text { text: "Add Selected"; color: white; font-size: 13px; font-weight: 700; horizontal-alignment: center; vertical-alignment: center; }
+                        }
+                        Rectangle {
+                            width: 100px; height: 36px; border-radius: 4px;
+                            background: btnCancel.has-hover ? #444 : #3a3a3a;
+                            border-width: 1px; border-color: #555;
+                            btnCancel := TouchArea { clicked => { root.findgames-cancel(); } }
+                            Text { text: "Cancel"; color: #aaa; font-size: 13px; horizontal-alignment: center; vertical-alignment: center; }
+                        }
+                    }
+                }
+            }
+        }
+
         if root.input-visible : Rectangle {
             x: 0px; y: 0px;
             width: root.width; height: root.height;
@@ -648,6 +784,7 @@ slint::slint! {
     }
 }
 use slint::VecModel;
+use slint::Model;
 
 fn fmt_dur(secs: f64) -> String {
     let s = secs as u64;
@@ -1362,7 +1499,7 @@ Failed: {}", failures.join(", ")));
         });
     }
 
-    // --- Find Game Saves (v1.6.0) ---
+    // --- Find Game Saves (v1.6.0 → v1.7.2: checkbox selection) ---
     {
         let w = app.as_weak();
         app.on_find_games_clicked(move || {
@@ -1375,53 +1512,125 @@ Failed: {}", failures.join(", ")));
                 if found.is_empty() {
                     rfd::MessageDialog::new()
                         .set_title("Find Game Saves")
-                        .set_description("No new game save locations found.\n\n(Scanned: Saved Games, Documents\\My Games, WB Games, Steam, Microsoft Store games. Folders already protected are skipped.)")
+                        .set_description("No new game save locations found.\n\n(Scanned: Saved Games, Documents\\My Games, WB Games, Steam, Microsoft Store. Already-protected folders are skipped.)")
                         .set_buttons(rfd::MessageButtons::Ok)
                         .show();
                     return;
                 }
-                let mut list = String::new();
-                for f in &found {
-                    list.push_str(&format!("\n  • {}  ({})", f.protect.display(), f.reason));
-                }
-                let add = rfd::MessageDialog::new()
-                    .set_title("Find Game Saves")
-                    .set_description(&format!("Found {} save location(s):{}\n\nAdd them to LRGEX Restore?", found.len(), list))
-                    .set_buttons(rfd::MessageButtons::YesNo)
-                    .show() == rfd::MessageDialogResult::Yes;
-                if !add { return; }
+                // Build the model — all selected by default (matches old add-all behavior)
+                let found_data: Vec<(String, String, String)> = found.iter().map(|f| (
+                    f.protect.file_name()
+                        .map(|n| n.to_string_lossy().to_string())
+                        .unwrap_or_default(),
+                    f.protect.to_string_lossy().to_string(),
+                    f.reason.clone(),
+                )).collect();
+                let _ = w.upgrade_in_event_loop(move |a| {
+                    let model = slint::VecModel::from_iter(found_data.iter().map(|(name, path, reason)| GameSaveEntry {
+                        name: name.clone().into(),
+                        path: path.clone().into(),
+                        reason: reason.clone().into(),
+                        selected: true,
+                    }));
+                    a.set_findgames_list(slint::ModelRc::new(model));
+                    a.set_findgames_all_checked(true);
+                    a.set_findgames_visible(true);
+                });
+            });
+        });
+    }
 
-                // Add + immediately back up each (force), with live progress.
-                for f in &found {
-                    let p = f.protect.to_string_lossy().to_string();
-                    let leaf = f.protect.file_name()
+    // Find Game Saves: toggle individual checkbox
+    {
+        let w = app.as_weak();
+        app.on_findgames_toggle(move |idx| {
+            if let Some(a) = w.upgrade() {
+                let list = a.get_findgames_list();
+                let i = idx as usize;
+                if (i as usize) < list.row_count() {
+                    if let Some(mut entry) = list.row_data(i) {
+                        entry.selected = !entry.selected;
+                        list.set_row_data(i, entry);
+                    }
+                }
+                let all = (0..list.row_count()).all(|i| list.row_data(i).map(|e| e.selected).unwrap_or(false));
+                a.set_findgames_all_checked(all);
+            }
+        });
+    }
+
+    // Find Game Saves: toggle all
+    {
+        let w = app.as_weak();
+        app.on_findgames_toggle_all(move |check| {
+            if let Some(a) = w.upgrade() {
+                let list = a.get_findgames_list();
+                for i in 0..list.row_count() {
+                    if let Some(mut entry) = list.row_data(i) {
+                        entry.selected = check;
+                        list.set_row_data(i, entry);
+                    }
+                }
+                a.set_findgames_all_checked(check);
+            }
+        });
+    }
+
+    // Find Game Saves: cancel — just hide
+    {
+        let w = app.as_weak();
+        app.on_findgames_cancel(move || {
+            if let Some(a) = w.upgrade() {
+                a.set_findgames_visible(false);
+            }
+        });
+    }
+
+    // Find Game Saves: confirm — add only SELECTED saves, backup on worker thread
+    {
+        let w = app.as_weak();
+        app.on_findgames_confirm(move || {
+            let a = match w.upgrade() { Some(a) => a, None => return };
+            a.set_findgames_visible(false);
+            // Collect selected paths on the UI thread (thin callback)
+            let list = a.get_findgames_list();
+            let selected: Vec<(String, String)> = (0..list.row_count())
+                .filter_map(|i| list.row_data(i))
+                .filter(|e| e.selected)
+                .map(|e| (e.path.to_string(), e.reason.to_string()))
+                .collect();
+            if selected.is_empty() { return; }
+            // Heavy work on a worker thread — reuses the add+backup loop
+            let w2 = w.clone();
+            std::thread::spawn(move || {
+                for (p, _reason) in &selected {
+                    let leaf = std::path::Path::new(p).file_name()
                         .map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
                     let mut cfg = config::load_config();
-                    if cfg.junctions.iter().any(|j| config::same_path(&j.source_path, &p)) {
+                    if cfg.junctions.iter().any(|j| config::same_path(&j.source_path, p)) {
                         continue; // already protected (race-safe re-check)
                     }
                     cfg.junctions.push(config::Junction {
                         source_path: p.clone(),
-                        volume_id: None,
                         auto_restore: true,
                         created: crate::synclog::timestamp(),
-                        is_game: true, // discovered AS a game — lamp always green
+                        is_game: true,
+                        volume_id: None,
                     });
                     if !config::save_config(&cfg) {
-                        rfd::MessageDialog::new()
-                            .set_title("Error")
-                            .set_description(&format!("Could not save the config — '{}' was NOT added.", leaf))
-                            .set_buttons(rfd::MessageButtons::Ok)
-                            .show();
+                        let msg = format!("Could not save config — '{}' NOT added", leaf);
+                        let _ = w2.upgrade_in_event_loop(move |a| {
+                            a.set_status_text(msg.into());
+                        });
                         continue;
                     }
                     crate::synclog::write_progress(&format!("Compressing {}...", leaf));
-                    let (ok, _msg) = crate::sync::sync_pair_to_cloud(
-                        &p, &cfg.excluded_names, cfg.max_versions, true);
+                    let (ok, _) = crate::sync::sync_pair_to_cloud(
+                        p, &cfg.excluded_names, cfg.max_versions, true);
                     crate::synclog::write_progress("");
                     if ok { crate::health::write_status(1, 0, 0, &[]); }
                 }
-                let _ = w.upgrade_in_event_loop(|a| { refresh_folders(&a); });
+                let _ = w2.upgrade_in_event_loop(|a| { refresh_folders(&a); });
             });
         });
     }
