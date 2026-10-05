@@ -1,5 +1,12 @@
 # Patch Notes — LRGEX Restore
 
+## v1.7.2 — Find Game Saves: pick what you want
+
+### New: checkbox selection in Find Game Saves
+- Each found save location shows its name, why it was flagged, and the full path — with a checkbox
+- Select All / Deselect All toggle for one-click control
+- Add Selected adds only what you checked — no more all-or-nothing
+
 ## v1.7.1 — Speed: seconds instead of minutes
 
 ### xxHash64 + mtime shortcut — syncs go from minutes to ~3 seconds
