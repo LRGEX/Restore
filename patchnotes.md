@@ -1,11 +1,16 @@
 # Patch Notes — LRGEX Restore
 
-## v1.7.2 — Find Game Saves: pick what you want
+## v1.7.3 — Find Game Saves: full control + reliability fixes
 
-### New: checkbox selection in Find Game Saves
-- Each found save location shows its name, why it was flagged, and the full path — with a checkbox
-- Select All / Deselect All toggle for one-click control
+### Find Game Saves: checkbox selection
+- Each found save location shows name, reason, and full path — with a checkbox
+- Select All / Deselect All toggle
 - Add Selected adds only what you checked — no more all-or-nothing
+
+### Fixed: Find Game Saves could leave the status stuck amber
+- Health status now ALWAYS updates after adding saves — even on failure
+- Clear completion message: "Added 3 folder(s)" or "Added 2, 1 failed — check sync log"
+- Never sits silently on "Compressing..." again
 
 ## v1.7.1 — Speed: seconds instead of minutes
 
