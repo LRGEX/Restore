@@ -1603,6 +1603,8 @@ Failed: {}", failures.join(", ")));
             // Heavy work on a worker thread — reuses the add+backup loop
             let w2 = w.clone();
             std::thread::spawn(move || {
+                let mut added = 0;
+                let mut failed = 0;
                 for (p, _reason) in &selected {
                     let leaf = std::path::Path::new(p).file_name()
                         .map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
@@ -1618,6 +1620,7 @@ Failed: {}", failures.join(", ")));
                         volume_id: None,
                     });
                     if !config::save_config(&cfg) {
+                        failed += 1;
                         let msg = format!("Could not save config — '{}' NOT added", leaf);
                         let _ = w2.upgrade_in_event_loop(move |a| {
                             a.set_status_text(msg.into());
@@ -1625,12 +1628,21 @@ Failed: {}", failures.join(", ")));
                         continue;
                     }
                     crate::synclog::write_progress(&format!("Compressing {}...", leaf));
-                    let (ok, _) = crate::sync::sync_pair_to_cloud(
+                    let (ok, reason) = crate::sync::sync_pair_to_cloud(
                         p, &cfg.excluded_names, cfg.max_versions, true);
                     crate::synclog::write_progress("");
-                    if ok { crate::health::write_status(1, 0, 0, &[]); }
+                    if ok { added += 1; } else { failed += 1; }
                 }
-                let _ = w2.upgrade_in_event_loop(|a| { refresh_folders(&a); });
+                // ALWAYS update health + status — never leave the lamp stuck amber
+                let done_msg = if failed > 0 {
+                    format!("Added {} folder(s), {} failed — check sync log", added, failed)
+                } else {
+                    format!("Added {} folder(s)", added)
+                };
+                let _ = w2.upgrade_in_event_loop(move |a| {
+                    a.set_status_text(done_msg.into());
+                    refresh_folders(&a);
+                });
             });
         });
     }
